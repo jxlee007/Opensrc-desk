@@ -1,0 +1,6 @@
+{
+  "name": "Extended Desktop",
+  "description": "Turn any secondary Android device (Android 5.0–9.0) into a zero-touch, auto-configured extended desktop monitor powered by an Android 10+ Host over Wi-Fi, Wi-Fi Direct, or USB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

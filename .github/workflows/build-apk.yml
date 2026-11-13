@@ -1,0 +1,111 @@
+name: Build Extended Desktop Debug APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*' # Triggers automatic GitHub Release publishing on version tags (e.g., v1.0.0)
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Enables manual runs from the GitHub Actions tab
+
+# Cancel stale in-progress runs for the same branch, PR, or tag to save runner minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug-apk:
+    name: Test & Build Debug APK
+    runs-on: ubuntu-latest
+
+    # Required for creating GitHub Releases and uploading release assets on v* tags
+    permissions:
+      contents: write
+
+    steps:
+      # 1. Check out the repository source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Provision JDK 21 (required for AGP 9.1.1, Gradle 9.3.1, and compileSdk 36)
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # 3. Configure Gradle 9.3.1 with automatic dependency & build caching
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      # 4. Generate an ephemeral debug.keystore matching app/build.gradle.kts debugConfig
+      - name: Generate ephemeral debug keystore
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storetype PKCS12 \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      # 5. Mark gradlew executable (or bootstrap Gradle 9.3.1 wrapper if absent in export)
+      - name: Prepare Gradle wrapper
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            gradle wrapper --gradle-version 9.3.1
+            chmod +x gradlew
+          fi
+
+      # 6. Fail-Fast Test Gate: Run JUnit & Robolectric tests before building the APK
+      - name: Run unit & Robolectric tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      # 7. Upload HTML & XML test reports ONLY if a unit or Robolectric test fails
+      - name: Upload test failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failure-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          retention-days: 7
+
+      # 8. Assemble the signed, installable debug APK (executes only if tests pass)
+      - name: Assemble Debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      # 9. Upload app-debug.apk as a downloadable build artifact on every successful run
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extended-desktop-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # 10. Copy and rename the APK cleanly for direct download on version tags (v*)
+      - name: Prepare versioned APK for Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cp app/build/outputs/apk/debug/app-debug.apk "extended-desktop-${GITHUB_REF_NAME}-debug.apk"
+
+      # 11. Publish a GitHub Release with auto-generated notes & direct .apk asset
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: extended-desktop-${{ github.ref_name }}-debug.apk
