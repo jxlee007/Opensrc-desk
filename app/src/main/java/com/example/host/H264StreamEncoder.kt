@@ -28,11 +28,10 @@ class H264StreamEncoder(
 
     fun start(): Surface {
         val mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val encCaps = runCatching {
-            mediaCodec.codecInfo
-                .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                ?.encoderCapabilities
+        val codecCaps = runCatching {
+            mediaCodec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
         }.getOrNull()
+        val encCaps = codecCaps?.encoderCapabilities
         val chosenBitrateMode = selectBitrateMode(
             supportsCbr = encCaps?.isBitrateModeSupported(
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
@@ -41,6 +40,10 @@ class H264StreamEncoder(
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
             ) == true
         )
+        val supportedProfiles = codecCaps?.profileLevels
+            ?.map { it.profile to it.level }
+            ?: emptyList()
+        val (chosenProfile, chosenLevel) = selectBaselineProfileLevel(supportedProfiles)
 
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
@@ -50,6 +53,13 @@ class H264StreamEncoder(
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateMbps * 1_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // Short 1s GOP
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, IDLE_REPEAT_FRAME_US)
+            if (chosenProfile != null) {
+                setInteger(MediaFormat.KEY_PROFILE, chosenProfile)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && chosenLevel != null) {
+                setInteger(MediaFormat.KEY_LEVEL, chosenLevel)
+            }
             if (chosenBitrateMode != null) {
                 setInteger(MediaFormat.KEY_BITRATE_MODE, chosenBitrateMode)
             }
@@ -162,10 +172,38 @@ class H264StreamEncoder(
     }
 
     companion object {
+        const val IDLE_REPEAT_FRAME_US = 100_000L
+
         fun selectBitrateMode(supportsCbr: Boolean, supportsVbr: Boolean): Int? = when {
             supportsCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             supportsVbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
             else -> null
+        }
+
+        /**
+         * Forces H.264 Baseline Profile (Level 3.1 when supported) so legacy hardware decoders
+         * such as TI OMAP4 / PowerVR SGX544 (OMX.IMG.MSVDX) do not reject High Profile streams.
+         */
+        fun selectBaselineProfileLevel(
+            supportedProfileLevels: List<Pair<Int, Int>>
+        ): Pair<Int?, Int?> {
+            val baseline = MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+            val level31 = MediaCodecInfo.CodecProfileLevel.AVCLevel31
+            if (supportedProfileLevels.isEmpty()) {
+                return baseline to level31
+            }
+            val baselineLevels = supportedProfileLevels
+                .filter { it.first == baseline }
+                .map { it.second }
+            if (baselineLevels.isEmpty()) {
+                return null to null
+            }
+            val chosenLevel = if (baselineLevels.any { it >= level31 }) {
+                level31
+            } else {
+                baselineLevels.maxOrNull()
+            }
+            return baseline to chosenLevel
         }
 
         fun writeLengthPrefixedFrame(out: DataOutputStream, nalBytes: ByteArray, probeTimestampMs: Long) {

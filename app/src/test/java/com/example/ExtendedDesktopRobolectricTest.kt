@@ -1211,4 +1211,54 @@ class ExtendedDesktopRobolectricTest {
             hostEngine.disconnect("Cleanup")
         }
     }
+
+    @Test
+    fun displaySessionEngineSurfacesSwFallbackAndFatalDecoderErrorToState() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dispStore = TrustedPeerStore(context, KeystoreCrypto(context, WorkingVault()), isolatedDataStore(context, "decoder_err_disp_ds"))
+        val displayEngine = DisplaySessionEngine(context, dispStore, KeystoreCrypto(context, WorkingVault()))
+        try {
+            assertEquals(1_000L, com.example.host.VirtualDisplayPresentation.CLOCK_TICK_INTERVAL_MS)
+
+            displayEngine.handleDecoderStatus(
+                com.example.display.H264StreamDecoder.DecoderStatus.SoftwareFallbackActive(
+                    codecName = "OMX.google.h264.decoder",
+                    hwFailureReason = "High profile unsupported"
+                )
+            )
+            assertEquals(
+                com.example.model.DisplayStreamOverlayState.Active,
+                displayEngine.sessionState.value.overlayState
+            )
+            assertTrue(
+                displayEngine.sessionState.value.decoderNotice?.contains("SW H.264 (OMX.google.h264.decoder)") == true
+            )
+
+            displayEngine.handleDecoderStatus(
+                com.example.display.H264StreamDecoder.DecoderStatus.FatalError("H.264 decode failed (HW + SW)")
+            )
+            val overlay = displayEngine.sessionState.value.overlayState
+            assertTrue(overlay is com.example.model.DisplayStreamOverlayState.DecoderError)
+            assertEquals(
+                "H.264 decode failed (HW + SW)",
+                (overlay as com.example.model.DisplayStreamOverlayState.DecoderError).message
+            )
+
+            displayEngine.handleDecoderStatus(
+                com.example.display.H264StreamDecoder.DecoderStatus.HardwareActive("OMX.qcom.video.decoder.avc")
+            )
+            assertEquals(
+                com.example.model.DisplayStreamOverlayState.Active,
+                displayEngine.sessionState.value.overlayState
+            )
+            assertNull(displayEngine.sessionState.value.decoderNotice)
+
+            // Detaching null surface stops cleanly even when idle
+            displayEngine.attachSurface(null)
+            displayEngine.disconnectSession("Test reset")
+            assertNull(displayEngine.sessionState.value.decoderNotice)
+        } finally {
+            displayEngine.stopAll()
+        }
+    }
 }

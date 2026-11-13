@@ -254,6 +254,33 @@ class VirtualDisplayPresentation(
         refreshMetadata()
     }
 
+    private var tickStarted = false
+    private val clockTickRunnable = object : Runnable {
+        override fun run() {
+            if (!tickStarted || !::rootContainer.isInitialized) return
+            clockText.text = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            rootContainer.invalidate()
+            rootContainer.postDelayed(this, CLOCK_TICK_INTERVAL_MS)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        tickStarted = true
+        if (::rootContainer.isInitialized) {
+            rootContainer.removeCallbacks(clockTickRunnable)
+            rootContainer.postDelayed(clockTickRunnable, CLOCK_TICK_INTERVAL_MS)
+        }
+    }
+
+    override fun onStop() {
+        tickStarted = false
+        if (::rootContainer.isInitialized) {
+            rootContainer.removeCallbacks(clockTickRunnable)
+        }
+        super.onStop()
+    }
+
     fun getVerificationTargetBounds(): VerificationTargetBounds? = cachedTargetBounds
 
     fun updateConfig(newConfig: VirtualDisplayConfig, newModeLabel: String) {
@@ -305,6 +332,10 @@ class VirtualDisplayPresentation(
                 "Input: $lastTouchCoords"
         statusChipText.text = "  •  $modeLabel"
         clockText.text = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+    }
+
+    companion object {
+        const val CLOCK_TICK_INTERVAL_MS = 1_000L
     }
 
     private class CursorReticleView(context: Context) : View(context) {

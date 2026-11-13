@@ -139,6 +139,10 @@ sealed interface DisplayStreamOverlayState {
         val message: String = "Reconnecting video…"
     ) : DisplayStreamOverlayState
 
+    data class DecoderError(
+        val message: String
+    ) : DisplayStreamOverlayState
+
     data class Disconnected(val reason: String) : DisplayStreamOverlayState
 }
 

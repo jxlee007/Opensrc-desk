@@ -46,7 +46,8 @@ data class DisplaySessionState(
     val fps: Int = 0,
     val latencyStats: LatencyProbeStats = LatencyProbeStats(),
     val sessionOnlyTrustMode: Boolean = false,
-    val securityNotice: String? = null
+    val securityNotice: String? = null,
+    val decoderNotice: String? = null
 )
 
 class DisplaySessionEngine(
@@ -75,8 +76,35 @@ class DisplaySessionEngine(
         },
         onStreamMetrics = { fps ->
             _sessionState.value = _sessionState.value.copy(fps = fps)
-        }
+        },
+        onDecoderStatus = ::handleDecoderStatus
     )
+
+    internal fun handleDecoderStatus(status: H264StreamDecoder.DecoderStatus) {
+        val current = _sessionState.value
+        _sessionState.value = when (status) {
+            is H264StreamDecoder.DecoderStatus.HardwareActive -> current.copy(
+                overlayState = if (current.overlayState is DisplayStreamOverlayState.DecoderError) {
+                    DisplayStreamOverlayState.Active
+                } else {
+                    current.overlayState
+                },
+                decoderNotice = null
+            )
+            is H264StreamDecoder.DecoderStatus.SoftwareFallbackActive -> current.copy(
+                overlayState = if (current.overlayState is DisplayStreamOverlayState.DecoderError) {
+                    DisplayStreamOverlayState.Active
+                } else {
+                    current.overlayState
+                },
+                decoderNotice = "SW H.264 (${status.codecName}) — HW unavailable"
+            )
+            is H264StreamDecoder.DecoderStatus.FatalError -> current.copy(
+                overlayState = DisplayStreamOverlayState.DecoderError(status.message),
+                decoderNotice = status.message
+            )
+        }
+    }
 
     private val preAuthMutex = Mutex()
     private var globalPreAuthCount = 0
@@ -159,10 +187,18 @@ class DisplaySessionEngine(
     }
 
     fun attachSurface(surface: Surface?) {
+        if (surface == null) {
+            outputSurface = null
+            decoder.stop()
+            return
+        }
+        if (outputSurface === surface && decoder.isActiveForSurface(surface)) {
+            return
+        }
         outputSurface = surface
         val state = _sessionState.value
         val cfg = state.activeConfig
-        if (surface != null && state.isConnected && cfg != null && state.videoPort > 0) {
+        if (state.isConnected && cfg != null && state.videoPort > 0) {
             decoder.start(state.hostIp, state.videoPort, cfg.targetWidth, cfg.targetHeight, surface)
         }
     }

@@ -104,13 +104,21 @@ fun DisplayTerminalScreen(
     var pillVisible by remember { mutableStateOf(true) }
 
     val overlay = session.overlayState
+    val isFatalDecoderError = overlay is DisplayStreamOverlayState.DecoderError
     val isWarningOverlay = overlay is DisplayStreamOverlayState.SwitchingMode ||
         overlay is DisplayStreamOverlayState.ReconnectingVideo ||
+        isFatalDecoderError ||
         isDegradedMode
 
     LaunchedEffect(session.listeningPort) {
         if (session.listeningPort > 0) {
             onEnsureDisplayStandby(session.listeningPort)
+        }
+    }
+
+    LaunchedEffect(session.decoderNotice) {
+        if (!session.decoderNotice.isNullOrBlank()) {
+            pillRevealTick++
         }
     }
 
@@ -379,6 +387,13 @@ fun DisplayTerminalScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = EmeraldOnline
                             )
+                            if (!session.decoderNotice.isNullOrBlank()) {
+                                Text(
+                                    text = "Decoder: ${session.decoderNotice}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isFatalDecoderError) CrimsonError else AmberWarning
+                                )
+                            }
                         }
                         if (state.savedPeers.isNotEmpty()) {
                             HorizontalDivider(color = SlateBorder)
@@ -571,17 +586,30 @@ fun DisplayTerminalScreen(
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(top = 12.dp)
         ) {
-            val pillColor = if (isWarningOverlay) AmberWarning else SlateSurface.copy(alpha = 0.88f)
-            val textColor = if (isWarningOverlay) ObsidianBg else TextPrimary
+            val pillColor = when {
+                isFatalDecoderError -> CrimsonError
+                isWarningOverlay -> AmberWarning
+                else -> SlateSurface.copy(alpha = 0.88f)
+            }
+            val textColor = when {
+                isFatalDecoderError -> Color.White
+                isWarningOverlay -> ObsidianBg
+                else -> TextPrimary
+            }
             val pillText = when (overlay) {
                 is DisplayStreamOverlayState.SwitchingMode -> overlay.message
                 is DisplayStreamOverlayState.ReconnectingVideo -> overlay.message
+                is DisplayStreamOverlayState.DecoderError -> overlay.message
                 else -> when {
                     isDegradedMode && !session.isConnected ->
                         DisplaySessionEngine.SESSION_ONLY_WARNING
                     session.isConnected -> {
                         val latency = session.latencyStats
-                        "${session.fps} FPS · ${latency.medianTouchToFrameMs} ms · Long-press pill for menu"
+                        if (!session.decoderNotice.isNullOrBlank()) {
+                            "${session.fps} FPS · ${session.decoderNotice} · Long-press for menu"
+                        } else {
+                            "${session.fps} FPS · ${latency.medianTouchToFrameMs} ms · Long-press pill for menu"
+                        }
                     }
                     else -> "${state.localIp}:${session.listeningPort} · Long-press for menu"
                 }

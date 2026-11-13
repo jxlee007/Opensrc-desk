@@ -577,4 +577,109 @@ class ExtendedDesktopUnitTest {
         assertFalse(eval.virtualDisplayMatched)
         assertTrue(eval.summaryLine.contains("vdHit=false"))
     }
+
+    @Test
+    fun h264StreamEncoderSelectsBaselineProfileLevel31AndIdleFrameRepeat() {
+        assertEquals(100_000L, com.example.host.H264StreamEncoder.IDLE_REPEAT_FRAME_US)
+
+        val baseline = android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+        val high = android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+        val level3 = android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel3
+        val level31 = android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel31
+        val level41 = android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel41
+
+        // Prefers Baseline Level 3.1 when codec supports Baseline 4.1 + High
+        assertEquals(
+            baseline to level31,
+            com.example.host.H264StreamEncoder.selectBaselineProfileLevel(
+                listOf(high to level41, baseline to level41)
+            )
+        )
+
+        // Caps gracefully if max supported Baseline level is below 3.1
+        assertEquals(
+            baseline to level3,
+            com.example.host.H264StreamEncoder.selectBaselineProfileLevel(
+                listOf(baseline to level3)
+            )
+        )
+
+        // Defaults to Baseline 3.1 when capability list is unavailable/empty
+        assertEquals(
+            baseline to level31,
+            com.example.host.H264StreamEncoder.selectBaselineProfileLevel(emptyList())
+        )
+
+        // Returns null pair when Baseline is completely absent
+        assertEquals(
+            null to null,
+            com.example.host.H264StreamEncoder.selectBaselineProfileLevel(listOf(high to level41))
+        )
+    }
+
+    @Test
+    fun h264StreamDecoderClassifiesAnnexBSpsPpsAndIdrAcross3And4ByteStartCodes() {
+        val sps = byteArrayOf(0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F)
+        val spsInfo = com.example.display.H264StreamDecoder.classifyAnnexBNalPacket(sps)
+        assertEquals(listOf(7), spsInfo.nalTypes)
+        assertTrue(spsInfo.isCodecConfig)
+        assertFalse(spsInfo.isKeyFrame)
+
+        val pps = byteArrayOf(0, 0, 0, 1, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
+        val ppsInfo = com.example.display.H264StreamDecoder.classifyAnnexBNalPacket(pps)
+        assertEquals(listOf(8), ppsInfo.nalTypes)
+        assertTrue(ppsInfo.isCodecConfig)
+        assertFalse(ppsInfo.isKeyFrame)
+
+        // Combined 4-byte SPS + 3-byte PPS config packet
+        val combined = byteArrayOf(
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F,
+            0, 0, 1, 0x68, 0xCE.toByte(), 0x3C
+        )
+        val combinedInfo = com.example.display.H264StreamDecoder.classifyAnnexBNalPacket(combined)
+        assertEquals(listOf(7, 8), combinedInfo.nalTypes)
+        assertTrue(combinedInfo.isCodecConfig)
+        assertFalse(combinedInfo.isKeyFrame)
+
+        // 3-byte Annex-B IDR slice (NAL type 5)
+        val idr3Byte = byteArrayOf(0, 0, 1, 0x65, 0x88.toByte(), 0x84.toByte())
+        val idrInfo = com.example.display.H264StreamDecoder.classifyAnnexBNalPacket(idr3Byte)
+        assertEquals(listOf(5), idrInfo.nalTypes)
+        assertFalse(idrInfo.isCodecConfig)
+        assertTrue(idrInfo.isKeyFrame)
+
+        // Coded non-IDR slice (NAL type 1)
+        val pFrame = byteArrayOf(0, 0, 0, 1, 0x41, 0x9A.toByte(), 0x01, 0x02)
+        val pInfo = com.example.display.H264StreamDecoder.classifyAnnexBNalPacket(pFrame)
+        assertEquals(listOf(1), pInfo.nalTypes)
+        assertFalse(pInfo.isCodecConfig)
+        assertFalse(pInfo.isKeyFrame)
+    }
+
+    @Test
+    fun h264StreamDecoderSelectsSoftwareAvcDecoderFallback() {
+        assertEquals(
+            "OMX.google.h264.decoder",
+            com.example.display.H264StreamDecoder.selectSoftwareAvcDecoderName(
+                listOf(
+                    "OMX.IMG.MSVDX.Decoder.AVC" to false,
+                    "OMX.google.h264.decoder" to true
+                )
+            )
+        )
+        assertEquals(
+            "c2.android.avc.decoder",
+            com.example.display.H264StreamDecoder.selectSoftwareAvcDecoderName(
+                listOf(
+                    "OMX.qcom.video.decoder.avc" to false,
+                    "c2.android.avc.decoder" to false
+                )
+            )
+        )
+        assertNull(
+            com.example.display.H264StreamDecoder.selectSoftwareAvcDecoderName(
+                listOf("OMX.IMG.MSVDX.Decoder.AVC" to false)
+            )
+        )
+    }
 }
