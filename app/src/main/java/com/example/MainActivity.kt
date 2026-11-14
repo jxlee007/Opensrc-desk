@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onLaunchApp = { pkg -> viewModel.launchAppOnExtendedDisplay(pkg) },
                                 onMoveAppBackToHost = { pkg -> viewModel.moveAppBackToHost(pkg) },
+                                onFocusDesktopShell = { viewModel.focusDesktopShell() },
                                 onRequestShizukuPermission = { viewModel.requestShizukuPermission() },
                                 onRefreshShizuku = { viewModel.refreshDiscovery() },
                                 onDisconnect = {

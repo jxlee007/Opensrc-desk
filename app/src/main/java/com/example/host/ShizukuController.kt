@@ -223,12 +223,18 @@ class ShizukuController(private val context: Context) {
         return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
     }
 
+    fun enableFreeformDesktopSupport(): Boolean {
+        if (!isAuthorized()) return false
+        return runCatching { desktopUserService?.enableFreeformDesktopSupport() == true }
+            .getOrDefault(false)
+    }
+
     fun launchAppOnDisplay(packageName: String, displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
         val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName) ?: return false
         val comp = launchIntent.component?.flattenToShortString()
 
-        // Prefer privileged UserService `am start --display <displayId>` when bound
+        // Prefer privileged UserService `am start --display <displayId> --windowingMode 5` when bound
         val launchedByUserService = runCatching {
             desktopUserService?.launchAppOnDisplay(packageName, comp, displayId) == true
         }.getOrDefault(false)

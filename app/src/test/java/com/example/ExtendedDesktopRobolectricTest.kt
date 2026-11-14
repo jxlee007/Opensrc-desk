@@ -1218,7 +1218,7 @@ class ExtendedDesktopRobolectricTest {
         val dispStore = TrustedPeerStore(context, KeystoreCrypto(context, WorkingVault()), isolatedDataStore(context, "decoder_err_disp_ds"))
         val displayEngine = DisplaySessionEngine(context, dispStore, KeystoreCrypto(context, WorkingVault()))
         try {
-            assertEquals(1_000L, com.example.host.VirtualDisplayPresentation.CLOCK_TICK_INTERVAL_MS)
+            assertEquals(1_000L, com.example.host.DesktopShellActivity.CLOCK_TICK_INTERVAL_MS)
 
             displayEngine.handleDecoderStatus(
                 com.example.display.H264StreamDecoder.DecoderStatus.SoftwareFallbackActive(
@@ -1259,6 +1259,86 @@ class ExtendedDesktopRobolectricTest {
             assertNull(displayEngine.sessionState.value.decoderNotice)
         } finally {
             displayEngine.stopAll()
+        }
+    }
+
+    @Test
+    fun workstationViewModelOnClearedPreservesServiceOwnedRuntimeAndDesktopState() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val runtime = com.example.service.WorkstationRuntime.getInstance(app)
+        try {
+            runtime.hostEngine.seedActiveDesktopAppsForTest(
+                pkgs = setOf("com.example.keepalive"),
+                connected = true
+            )
+            val store = androidx.lifecycle.ViewModelStore()
+            val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(app)
+            val vm = androidx.lifecycle.ViewModelProvider(store, factory)[com.example.ui.WorkstationViewModel::class.java]
+            assertTrue(runtime.hostEngine === vm.hostEngine)
+
+            // Closing MainActivity destroys ViewModelStore -> calls onCleared()
+            store.clear()
+
+            // Live session & active apps remain intact inside service-backed WorkstationRuntime
+            assertTrue(runtime.hostEngine.telemetry.value.connected)
+            assertTrue(runtime.hostEngine.telemetry.value.activeDesktopApps.contains("com.example.keepalive"))
+
+            // Explicit Stop from notification DOES disconnect the session cleanly
+            runtime.stopAllFromServiceNotification()
+            assertFalse(runtime.hostEngine.telemetry.value.connected)
+        } finally {
+            runtime.stopAllFromServiceNotification()
+        }
+    }
+
+    @Test
+    fun desktopShellBridgeLaunchVerificationDetectsDisplayMismatchAndExceptions() {
+        var rejectedExpected: Int? = null
+        var rejectedActual: Int? = -99
+        val cfg = com.example.model.VirtualDisplayConfig(
+            targetWidth = 1280,
+            targetHeight = 800,
+            targetDpi = 160,
+            refreshRateFps = 60,
+            bitrateMbps = 4,
+            forceTabletLayout = true,
+            resolutionCeiling = com.example.model.ResolutionCeiling.P800,
+            is24GhzAdapted = true
+        )
+        try {
+            com.example.host.DesktopShellBridge.prepareSession(
+                expectedDisplayId = 3,
+                config = cfg,
+                modeLabel = "SHIZUKU FULL",
+                shizukuAuthorized = true,
+                apps = emptyList(),
+                diagnosticOnly = false,
+                shellCallbacks = object : com.example.host.DesktopShellBridge.ShellCallbacks {
+                    override fun onLaunchAppFromTaskbar(packageName: String) = Unit
+                    override fun onWorkspaceLayerChanged(webLayerActive: Boolean) = Unit
+                    override fun onDrawerVisibilityChanged(visible: Boolean) = Unit
+                    override fun onShellDisplayVerified(displayId: Int) = Unit
+                    override fun onShellDisplayRejected(expectedDisplayId: Int, actualDisplayId: Int?) {
+                        rejectedExpected = expectedDisplayId
+                        rejectedActual = actualDisplayId
+                    }
+                    override fun onVerificationTouchObserved(event: com.example.host.ObservedTouchEvent) = Unit
+                }
+            )
+            assertTrue(com.example.host.DesktopShellBridge.shizukuAuthorized)
+            assertFalse(com.example.host.DesktopShellBridge.webLayerActive)
+
+            com.example.host.DesktopShellBridge.reportDisplayMismatch(expectedDisplayId = 3, actualDisplayId = 0)
+            assertNull(com.example.host.DesktopShellBridge.verifiedDisplayId)
+            assertEquals(3, rejectedExpected)
+            assertEquals(0, rejectedActual)
+            assertTrue(com.example.host.DesktopShellBridge.launchStatusNote.contains("Display 3"))
+
+            com.example.host.DesktopShellBridge.reportLaunchException(3, SecurityException("blocked display"))
+            assertNull(rejectedActual)
+            assertTrue(com.example.host.DesktopShellBridge.launchStatusNote.contains("blocked display"))
+        } finally {
+            com.example.host.DesktopShellBridge.releaseAndCloseShell()
         }
     }
 }

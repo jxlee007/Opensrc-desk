@@ -15,6 +15,12 @@ class ShizukuDesktopUserService : IShizukuDesktopService.Stub() {
 
     private var cachedShellDFlag: Boolean? = null
 
+    override fun enableFreeformDesktopSupport(): Boolean {
+        val r1 = execCommand(arrayOf("settings", "put", "global", "enable_freeform_support", "1"))
+        val r2 = execCommand(arrayOf("settings", "put", "global", "force_resizable_activities", "1"))
+        return r1.exitCode == 0 && r2.exitCode == 0
+    }
+
     override fun launchAppOnDisplay(
         packageName: String,
         activityComponent: String?,
@@ -23,24 +29,21 @@ class ShizukuDesktopUserService : IShizukuDesktopService.Stub() {
         val safePkg = packageName.replace(Regex("[^A-Za-z0-9._]"), "")
         if (safePkg.isBlank() || displayId < 0) return false
 
-        val cmd = if (!activityComponent.isNullOrBlank() && activityComponent.contains('/')) {
-            val safeComp = activityComponent.replace(Regex("[^A-Za-z0-9._/$]"), "")
-            arrayOf(
-                "am", "start",
-                "--display", displayId.toString(),
-                "-n", safeComp,
-                "-f", "0x10000000"
-            )
-        } else {
-            arrayOf(
-                "monkey", "-p", safePkg,
-                "-c", "android.intent.category.LAUNCHER", "1"
-            )
+        if (displayId > 0) {
+            enableFreeformDesktopSupport()
         }
 
-        // First force-stop or relocate duplicate Host instance if requested via am start --display
-        val result = execCommand(cmd)
-        return result.exitCode == 0
+        val comp = activityComponent
+            ?.takeIf { it.contains('/') }
+            ?.replace(Regex("[^A-Za-z0-9._/$]"), "")
+
+        val freeformCmd = buildFreeformLaunchCommand(safePkg, comp, displayId)
+        if (execCommand(freeformCmd).exitCode == 0) {
+            return true
+        }
+
+        val fallbackCmd = buildFallbackLaunchCommand(safePkg, comp, displayId)
+        return execCommand(fallbackCmd).exitCode == 0
     }
 
     override fun queryHostForegroundPackages(displayId: Int): String {
@@ -165,7 +168,42 @@ class ShizukuDesktopUserService : IShizukuDesktopService.Stub() {
 
     companion object {
         private const val ACTION_TAP = 0
+        const val WINDOWING_MODE_FREEFORM = 5
         private val PACKAGE_REGEX = Regex("(?:realActivity|topActivity)=ComponentInfo\\{?([A-Za-z0-9._]+)/")
+
+        fun buildFreeformLaunchCommand(
+            safePkg: String,
+            safeComp: String?,
+            displayId: Int
+        ): Array<String> = if (!safeComp.isNullOrBlank()) {
+            arrayOf(
+                "am", "start",
+                "--display", displayId.toString(),
+                "--windowingMode", WINDOWING_MODE_FREEFORM.toString(),
+                "-n", safeComp,
+                "-f", "0x10000000"
+            )
+        } else {
+            arrayOf(
+                "am", "start",
+                "--display", displayId.toString(),
+                "--windowingMode", WINDOWING_MODE_FREEFORM.toString(),
+                "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER",
+                "-p", safePkg,
+                "-f", "0x10000000"
+            )
+        }
+
+        fun buildFallbackLaunchCommand(
+            safePkg: String,
+            safeComp: String?,
+            displayId: Int
+        ): Array<String> = if (!safeComp.isNullOrBlank()) {
+            arrayOf("am", "start", "--display", displayId.toString(), "-n", safeComp, "-f", "0x10000000")
+        } else {
+            arrayOf("monkey", "-p", safePkg, "-c", "android.intent.category.LAUNCHER", "1")
+        }
     }
 }
 

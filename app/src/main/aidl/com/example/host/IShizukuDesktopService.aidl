@@ -1,6 +1,7 @@
 package com.example.host;
 
 interface IShizukuDesktopService {
+    boolean enableFreeformDesktopSupport();
     boolean launchAppOnDisplay(String packageName, String activityComponent, int displayId);
     String queryHostForegroundPackages(int displayId);
     boolean probeShellInputDisplayFlag();

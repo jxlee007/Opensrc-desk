@@ -316,7 +316,11 @@ class H264StreamDecoder(
         onFrameRendered: () -> Unit
     ) {
         var outIdx = mediaCodec.dequeueOutputBuffer(info, 5_000L)
-        while (outIdx >= 0) {
+        while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                outIdx = mediaCodec.dequeueOutputBuffer(info, 5_000L)
+                continue
+            }
             val shouldRender = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0
             mediaCodec.releaseOutputBuffer(outIdx, shouldRender)
             if (shouldRender) {

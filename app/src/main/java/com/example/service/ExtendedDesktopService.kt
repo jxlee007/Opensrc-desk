@@ -21,6 +21,13 @@ class ExtendedDesktopService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            WorkstationRuntime.getIfInitialized()?.stopAllFromServiceNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
             stopSelf()
             return START_NOT_STICKY
         }
@@ -39,6 +46,11 @@ class ExtendedDesktopService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // VirtualDisplay, DesktopShellActivity, H264StreamEncoder, and sockets belong to this
+        // foreground service and must survive closing MainActivity or swiping it from Recents.
     }
 
     companion object {

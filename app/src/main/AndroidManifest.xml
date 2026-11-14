@@ -70,6 +70,16 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".host.DesktopShellActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:taskAffinity="${applicationId}.desktop"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".service.ExtendedDesktopService"
             android:exported="false"

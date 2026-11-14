@@ -1,0 +1,1338 @@
+To achieve a complete Samsung DeX / Laptop Extended Desktop experience across any Android 10+ Host and your Galaxy Tab 2—with zero blank screens, overlapping resizable native windows, an interactive desktop taskbar, a zero-data-loss WebView pull-through fallback, and no Android 7 DT_TEXTREL popup—apply the four upgrades below in order.
+1. Fix the Blank Screen on Galaxy Tab 2 (H264StreamEncoder, H264StreamDecoder, DisplaySessionEngine)
+This resolves the H.264 High Profile rejection on PowerVR SGX544, flags SPS/PPS config buffers (BUFFER_FLAG_CODEC_CONFIG), prevents duplicate Surface disconnects, and adds automatic software H.264 fallback (OMX.google.h264.decoder) with status pill diagnostics.
+A. app/src/main/java/com/example/host/H264StreamEncoder.kt
+Configure H.264 Baseline Profile (AVCProfileBaseline + AVCLevel31) and 100 ms frame repetition (Long microseconds):
+package com.example.host
+
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.os.Build
+import android.os.Bundle
+import android.view.Surface
+import java.io.DataOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+class H264StreamEncoder(
+    private val width: Int,
+    private val height: Int,
+    private val bitrateMbps: Int,
+    private val fps: Int = 60,
+    private val onEncodedFrame: (ByteArray, Long) -> Unit,
+    private val onMetrics: (fps: Int, kbps: Int) -> Unit
+) {
+    private var codec: MediaCodec? = null
+    var inputSurface: Surface? = null
+        private set
+
+    private val running = AtomicBoolean(false)
+    private var drainThread: Thread? = null
+    private val lastSyncRequestMs = AtomicLong(0L)
+
+    fun start(): Surface {
+        val mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val encCaps = runCatching {
+            mediaCodec.codecInfo
+                .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                ?.encoderCapabilities
+        }.getOrNull()
+        val chosenBitrateMode = selectBitrateMode(
+            supportsCbr = encCaps?.isBitrateModeSupported(
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            ) == true,
+            supportsVbr = encCaps?.isBitrateModeSupported(
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            ) == true
+        )
+
+        val profileCaps = runCatching {
+            mediaCodec.codecInfo
+                .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                ?.profileLevels
+        }.getOrNull().orEmpty()
+        val baselineLevel = profileCaps
+            .filter { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline }
+            .maxOfOrNull { it.level }
+            ?.coerceAtMost(MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            ?: MediaCodecInfo.CodecProfileLevel.AVCLevel31
+
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrateMbps * 1_000_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // Repeat last frame after 100ms (in microseconds) so late-attaching decoders get frames
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            if (profileCaps.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline }) {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                setInteger(MediaFormat.KEY_LEVEL, baselineLevel)
+            }
+            if (chosenBitrateMode != null) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE, chosenBitrateMode)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
+        }
+
+        mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surface = mediaCodec.createInputSurface()
+        mediaCodec.start()
+
+        codec = mediaCodec
+        inputSurface = surface
+        running.set(true)
+
+        drainThread = Thread({ drainLoop(mediaCodec) }, "ExtDesk-H264Encoder").apply {
+            start()
+        }
+        return surface
+    }
+
+    fun requestSyncFrameBurst() {
+        val now = System.currentTimeMillis()
+        if (now - lastSyncRequestMs.get() < 250L) return
+        lastSyncRequestMs.set(now)
+        runCatching {
+            codec?.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+        }
+    }
+
+    fun stop() {
+        running.set(false)
+        runCatching { codec?.signalEndOfInputStream() }
+        runCatching { drainThread?.join(500) }
+        drainThread = null
+        runCatching { codec?.stop() }
+        runCatching { codec?.release() }
+        codec = null
+        inputSurface?.release()
+        inputSurface = null
+    }
+
+    private fun drainLoop(mediaCodec: MediaCodec) {
+        val info = MediaCodec.BufferInfo()
+        var frameCount = 0
+        var byteAccum = 0L
+        var windowStartMs = System.currentTimeMillis()
+        var configBytes: ByteArray? = null
+
+        while (running.get()) {
+            val outIndex = try {
+                mediaCodec.dequeueOutputBuffer(info, 10_000L)
+            } catch (_: Throwable) {
+                break
+            }
+            if (outIndex >= 0) {
+                val outBuf = mediaCodec.getOutputBuffer(outIndex)
+                if (outBuf != null && info.size > 0) {
+                    outBuf.position(info.offset)
+                    outBuf.limit(info.offset + info.size)
+                    val data = ByteArray(info.size)
+                    outBuf.get(data)
+
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        configBytes = data
+                        onEncodedFrame(data, System.currentTimeMillis())
+                    } else {
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 && configBytes != null) {
+                            onEncodedFrame(configBytes!!, System.currentTimeMillis())
+                        }
+                        onEncodedFrame(data, System.currentTimeMillis())
+                        frameCount++
+                        byteAccum += data.size
+                    }
+                }
+                mediaCodec.releaseOutputBuffer(outIndex, false)
+            }
+
+            val now = System.currentTimeMillis()
+            val elapsed = now - windowStartMs
+            if (elapsed >= 1000L) {
+                val measuredFps = ((frameCount * 1000f) / elapsed).toInt()
+                val kbps = ((byteAccum * 8L) / elapsed).toInt()
+                onMetrics(measuredFps, kbps)
+                frameCount = 0
+                byteAccum = 0L
+                windowStartMs = now
+            }
+        }
+    }
+
+    companion object {
+        fun selectBitrateMode(supportsCbr: Boolean, supportsVbr: Boolean): Int? = when {
+            supportsCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            supportsVbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            else -> null
+        }
+
+        fun writeLengthPrefixedFrame(out: DataOutputStream, nalBytes: ByteArray, probeTimestampMs: Long) {
+            synchronized(out) {
+                out.writeInt(nalBytes.size)
+                out.writeLong(probeTimestampMs)
+                out.write(nalBytes)
+                out.flush()
+            }
+        }
+    }
+}
+
+B. app/src/main/java/com/example/display/H264StreamDecoder.kt
+Inspect Annex-B NAL start codes (7/8 -> BUFFER_FLAG_CODEC_CONFIG + csd-0 caching; 5 -> BUFFER_FLAG_KEY_FRAME), drain INFO_OUTPUT_FORMAT_CHANGED immediately, and auto-fall back to software H.264 on hardware failure:
+package com.example.display
+
+import android.media.MediaCodec
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.view.Surface
+import com.example.model.LatencyProbeStats
+import java.io.DataInputStream
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+class H264StreamDecoder(
+    private val onFirstOrResumedFrame: () -> Unit,
+    private val onLatencyStats: (LatencyProbeStats) -> Unit,
+    private val onStreamMetrics: (fps: Int) -> Unit,
+    private val onDecoderStateChanged: (softwareFallback: Boolean, errorMessage: String?) -> Unit = { _, _ -> }
+) {
+    private val running = AtomicBoolean(false)
+    private var videoSocket: Socket? = null
+    private var codec: MediaCodec? = null
+    private var workerThread: Thread? = null
+    private var activeSurface: Surface? = null
+
+    val lastFrameDecodedMs = AtomicLong(0L)
+    private val latencyWindow = ArrayDeque<Long>(32)
+
+    fun start(
+        hostIp: String,
+        videoPort: Int,
+        width: Int,
+        height: Int,
+        outputSurface: Surface
+    ) {
+        if (running.get() && activeSurface === outputSurface && videoSocket?.isConnected == true) {
+            return
+        }
+        stop()
+        activeSurface = outputSurface
+        running.set(true)
+        lastFrameDecodedMs.set(System.currentTimeMillis())
+        workerThread = Thread({
+            runDecodeLoop(hostIp, videoPort, width, height, outputSurface)
+        }, "ExtDesk-H264Decoder").apply {
+            start()
+        }
+    }
+
+    fun stop() {
+        running.set(false)
+        activeSurface = null
+        runCatching { videoSocket?.close() }
+        runCatching { workerThread?.join(400) }
+        workerThread = null
+        videoSocket = null
+        releaseCodecQuietly(codec)
+        codec = null
+    }
+
+    private fun runDecodeLoop(
+        hostIp: String,
+        videoPort: Int,
+        width: Int,
+        height: Int,
+        outputSurface: Surface
+    ) {
+        var usingSoftware = false
+        var cachedCsd0: ByteArray? = null
+
+        try {
+            val sock = Socket().apply {
+                tcpNoDelay = true
+                connect(InetSocketAddress(hostIp, videoPort), 5000)
+            }
+            videoSocket = sock
+            val inp = DataInputStream(sock.getInputStream())
+
+            var mediaCodec = createConfiguredDecoder(
+                width = width,
+                height = height,
+                surface = outputSurface,
+                preferSoftware = false,
+                csd0 = null
+            )
+            if (mediaCodec == null) {
+                usingSoftware = true
+                mediaCodec = createConfiguredDecoder(
+                    width = width,
+                    height = height,
+                    surface = outputSurface,
+                    preferSoftware = true,
+                    csd0 = null
+                )
+            }
+            if (mediaCodec == null) {
+                onDecoderStateChanged(false, "H.264 decoder unavailable on this Display")
+                return
+            }
+            codec = mediaCodec
+            onDecoderStateChanged(usingSoftware, null)
+
+            val info = MediaCodec.BufferInfo()
+            var frameCount = 0
+            var fpsWindowStart = System.currentTimeMillis()
+
+            while (running.get()) {
+                val nalLen = inp.readInt()
+                val probeTimestampMs = inp.readLong()
+                if (nalLen <= 0 || nalLen > 4 * 1024 * 1024) break
+                val nalBytes = ByteArray(nalLen)
+                inp.readFully(nalBytes)
+
+                val nalType = extractPrimaryNalType(nalBytes)
+                val isConfig = nalType == 7 || nalType == 8
+                val isKeyFrame = nalType == 5
+                if (isConfig) {
+                    cachedCsd0 = nalBytes
+                }
+                val bufferFlags = when {
+                    isConfig -> MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+                    isKeyFrame -> MediaCodec.BUFFER_FLAG_KEY_FRAME
+                    else -> 0
+                }
+
+                try {
+                    queueAndDrain(
+                        mediaCodec = mediaCodec!!,
+                        nalBytes = nalBytes,
+                        bufferFlags = bufferFlags,
+                        probeTimestampMs = probeTimestampMs,
+                        info = info,
+                        onFrameRendered = {
+                            lastFrameDecodedMs.set(System.currentTimeMillis())
+                            onFirstOrResumedFrame()
+                            frameCount++
+                        }
+                    )
+                } catch (codecErr: Throwable) {
+                    if (!usingSoftware) {
+                        // Auto-fallback to software H.264 decoder (OMX.google / c2.android)
+                        releaseCodecQuietly(mediaCodec)
+                        usingSoftware = true
+                        mediaCodec = createConfiguredDecoder(
+                            width = width,
+                            height = height,
+                            surface = outputSurface,
+                            preferSoftware = true,
+                            csd0 = cachedCsd0
+                        )
+                        codec = mediaCodec
+                        if (mediaCodec == null) {
+                            onDecoderStateChanged(true, "HW & SW H.264 decode failed: ${codecErr.message}")
+                            break
+                        }
+                        onDecoderStateChanged(true, null)
+                        if (!isConfig) {
+                            runCatching {
+                                queueAndDrain(
+                                    mediaCodec = mediaCodec,
+                                    nalBytes = nalBytes,
+                                    bufferFlags = bufferFlags,
+                                    probeTimestampMs = probeTimestampMs,
+                                    info = info,
+                                    onFrameRendered = {
+                                        lastFrameDecodedMs.set(System.currentTimeMillis())
+                                        onFirstOrResumedFrame()
+                                        frameCount++
+                                    }
+                                )
+                            }
+                        }
+                    } else {
+                        onDecoderStateChanged(true, "SW H.264 decoder error: ${codecErr.message}")
+                        break
+                    }
+                }
+
+                val now = System.currentTimeMillis()
+                if (now - fpsWindowStart >= 1000L) {
+                    onStreamMetrics(frameCount)
+                    frameCount = 0
+                    fpsWindowStart = now
+                }
+            }
+        } catch (t: Throwable) {
+            if (running.get()) {
+                onDecoderStateChanged(usingSoftware, "Video stream interrupted: ${t.message ?: "closed"}")
+            }
+        }
+    }
+
+    private fun queueAndDrain(
+        mediaCodec: MediaCodec,
+        nalBytes: ByteArray,
+        bufferFlags: Int,
+        probeTimestampMs: Long,
+        info: MediaCodec.BufferInfo,
+        onFrameRendered: () -> Unit
+    ) {
+        val inIdx = mediaCodec.dequeueInputBuffer(10_000L)
+        if (inIdx >= 0) {
+            val inBuf = mediaCodec.getInputBuffer(inIdx)
+            if (inBuf != null) {
+                inBuf.clear()
+                inBuf.put(nalBytes)
+                mediaCodec.queueInputBuffer(
+                    inIdx,
+                    0,
+                    nalBytes.size,
+                    System.nanoTime() / 1000L,
+                    bufferFlags
+                )
+            }
+        }
+
+        var outIdx = mediaCodec.dequeueOutputBuffer(info, 5_000L)
+        while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                outIdx = mediaCodec.dequeueOutputBuffer(info, 5_000L)
+                continue
+            }
+            mediaCodec.releaseOutputBuffer(outIdx, true)
+            onFrameRendered()
+            if (probeTimestampMs > 0L) {
+                val elapsed = (System.currentTimeMillis() - probeTimestampMs).coerceAtLeast(1L)
+                recordLatencySample(elapsed)
+            }
+            outIdx = mediaCodec.dequeueOutputBuffer(info, 0L)
+        }
+    }
+
+    private fun createConfiguredDecoder(
+        width: Int,
+        height: Int,
+        surface: Surface,
+        preferSoftware: Boolean,
+        csd0: ByteArray?
+    ): MediaCodec? {
+        return try {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
+            if (csd0 != null) {
+                format.setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
+            }
+            val codecInstance = if (preferSoftware) {
+                val swName = findSoftwareAvcDecoderName() ?: "OMX.google.h264.decoder"
+                MediaCodec.createByCodecName(swName)
+            } else {
+                MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            }
+            codecInstance.configure(format, surface, null, 0)
+            codecInstance.start()
+            codecInstance
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun findSoftwareAvcDecoderName(): String? {
+        val infos = runCatching {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        }.getOrNull().orEmpty()
+        return infos.firstOrNull { info ->
+            !info.isEncoder &&
+                info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) } &&
+                (info.name.startsWith("OMX.google.", ignoreCase = true) ||
+                    info.name.startsWith("c2.android.", ignoreCase = true))
+        }?.name
+    }
+
+    private fun releaseCodecQuietly(target: MediaCodec?) {
+        runCatching { target?.stop() }
+        runCatching { target?.release() }
+    }
+
+    private fun recordLatencySample(elapsedMs: Long) {
+        synchronized(latencyWindow) {
+            if (latencyWindow.size >= 25) {
+                latencyWindow.removeFirst()
+            }
+            latencyWindow.addLast(elapsedMs)
+            val sorted = latencyWindow.sorted()
+            val median = sorted[sorted.size / 2]
+            onLatencyStats(
+                LatencyProbeStats(
+                    lastTouchToFrameMs = elapsedMs,
+                    medianTouchToFrameMs = median,
+                    sampleCount = sorted.size
+                )
+            )
+        }
+    }
+
+    companion object {
+        /**
+         * Inspects 3-byte (00 00 01) and 4-byte (00 00 00 01) Annex-B start codes to identify NAL type.
+         */
+        fun extractPrimaryNalType(bytes: ByteArray): Int {
+            var i = 0
+            while (i + 3 < bytes.size) {
+                if (bytes[i] == 0.toByte() && bytes[i + 1] == 0.toByte()) {
+                    if (bytes[i + 2] == 1.toByte()) {
+                        return bytes[i + 3].toInt() and 0x1F
+                    }
+                    if (i + 4 < bytes.size && bytes[i + 2] == 0.toByte() && bytes[i + 3] == 1.toByte()) {
+                        return bytes[i + 4].toInt() and 0x1F
+                    }
+                }
+                i++
+            }
+            return -1
+        }
+    }
+}
+
+C. DisplayModels.kt & DisplayTerminalScreen.kt Pill Wiring
+Add DecoderError to DisplayStreamOverlayState in DisplayModels.kt:
+sealed interface DisplayStreamOverlayState {
+    data object Active : DisplayStreamOverlayState
+    data class SwitchingMode(
+        val message: String = "Host switching to Layout Preview"
+    ) : DisplayStreamOverlayState
+
+    data class ReconnectingVideo(
+        val message: String = "Reconnecting video…"
+    ) : DisplayStreamOverlayState
+
+    data class DecoderError(val message: String) : DisplayStreamOverlayState
+    data class Disconnected(val reason: String) : DisplayStreamOverlayState
+}
+
+In DisplaySessionEngine.kt, pass onDecoderStateChanged into H264StreamDecoder so software fallback sets securityNotice = "SW H.264 fallback active" and fatal errors set overlayState = DisplayStreamOverlayState.DecoderError(err).
+2. True Native DeX Freeform Windows (IShizukuDesktopService.aidl, ShizukuDesktopUserService.kt, ShizukuController.kt)
+Enables Android 10's hidden multi-window flags (enable_freeform_support & force_resizable_activities) and launches native Android apps onto displayId 1 in Freeform Windowing Mode (--windowingMode 5) so apps open in overlapping, movable tablet windows above your desktop taskbar.
+A. Add to app/src/main/aidl/com/example/host/IShizukuDesktopService.aidl
+boolean enableFreeformDesktopSupport();
+
+B. Update launchAppOnDisplay in app/src/main/java/com/example/host/ShizukuDesktopUserService.kt
+override fun enableFreeformDesktopSupport(): Boolean {
+    val r1 = execCommand(arrayOf("settings", "put", "global", "enable_freeform_support", "1"))
+    val r2 = execCommand(arrayOf("settings", "put", "global", "force_resizable_activities", "1"))
+    return r1.exitCode == 0 && r2.exitCode == 0
+}
+
+override fun launchAppOnDisplay(
+    packageName: String,
+    activityComponent: String?,
+    displayId: Int
+): Boolean {
+    val safePkg = packageName.replace(Regex("[^A-Za-z0-9._]"), "")
+    if (safePkg.isBlank() || displayId < 0) return false
+
+    if (displayId > 0) {
+        enableFreeformDesktopSupport()
+    }
+
+    val comp = activityComponent
+        ?.takeIf { it.contains('/') }
+        ?.replace(Regex("[^A-Za-z0-9._/$]"), "")
+
+    // Primary: Launch in Freeform Desktop Windowing Mode (--windowingMode 5) on displayId 1
+    val freeformCmd = if (!comp.isNullOrBlank()) {
+        arrayOf(
+            "am", "start",
+            "--display", displayId.toString(),
+            "--windowingMode", "5",
+            "-n", comp,
+            "-f", "0x10000000"
+        )
+    } else {
+        arrayOf(
+            "am", "start",
+            "--display", displayId.toString(),
+            "--windowingMode", "5",
+            "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER",
+            "-p", safePkg,
+            "-f", "0x10000000"
+        )
+    }
+
+    if (execCommand(freeformCmd).exitCode == 0) {
+        return true
+    }
+
+    // Fallback for OEM ROMs that ignore --windowingMode 5: standard multi-display launch
+    val fallbackCmd = if (!comp.isNullOrBlank()) {
+        arrayOf("am", "start", "--display", displayId.toString(), "-n", comp, "-f", "0x10000000")
+    } else {
+        arrayOf("monkey", "-p", safePkg, "-c", "android.intent.category.LAUNCHER", "1")
+    }
+    return execCommand(fallbackCmd).exitCode == 0
+}
+
+3. DeX Desktop Shell + Stateful WebView Pull-Through (VirtualDisplayPresentation.kt & HostSessionEngine.kt)
+Upgrades VirtualDisplayPresentation into a true laptop desktop shell on displayId 1 (1280×800 @ 160 dpi):
+ * 1-Second Live Clock & Frame Ticker (eliminates idle frame starvation).
+ * Interactive Taskbar (⊞ Apps + 🌐 Web + Live Clock): Tap ⊞ Apps directly on your Galaxy Tab 2 to open a DeX-style App Launcher overlay on displayId 1, or tap 🌐 Web to pull through the 2-Tier Stateful Desktop WebView with a 180 ms crossfade and zero data loss (warm onPause() on healthy RAM; cold Bundle saveState() when RAM tightens).
+ * Direct In-Process Touch & IME Routing: When Shizuku is off (or when the WebView layer is pulled forward), HostSessionEngine forwards tablet TouchSample packets (DOWN/MOVE/UP) and Host keyboard input straight into VirtualDisplayPresentation with zero special permissions.
+A. app/src/main/java/com/example/host/VirtualDisplayPresentation.kt
+package com.example.host
+
+import android.annotation.SuppressLint
+import android.app.Presentation
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.Display
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import com.example.R
+import com.example.model.InstalledAppInfo
+import com.example.model.VirtualDisplayConfig
+import com.example.protocol.TouchSample
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+data class VerificationTargetBounds(
+    val displayId: Int,
+    val widthPx: Int,
+    val heightPx: Int,
+    val centerXPx: Float,
+    val centerYPx: Float
+)
+
+class VirtualDisplayPresentation(
+    context: Context,
+    display: Display,
+    private var config: VirtualDisplayConfig,
+    private var modeLabel: String,
+    private val onLaunchAppFromTaskbar: ((String) -> Unit)? = null,
+    private val onWorkspaceLayerChanged: ((webLayerActive: Boolean) -> Unit)? = null,
+    private val onVerificationTouchObserved: ((ObservedTouchEvent) -> Unit)? = null
+) : Presentation(context, display) {
+
+    private lateinit var rootContainer: FrameLayout
+    private lateinit var desktopInfoText: TextView
+    private lateinit var statusChipText: TextView
+    private lateinit var clockText: TextView
+    private lateinit var cursorView: CursorReticleView
+
+    // DeX Start / App Launcher Drawer overlay on displayId 1
+    private lateinit var appDrawerOverlay: LinearLayout
+    private lateinit var appDrawerGrid: GridLayout
+    private var availableApps: List<InstalledAppInfo> = emptyList()
+
+    // 2-Tier Stateful WebView Pull-Through Layer (Warm Pause + Cold Bundle Snapshot)
+    private lateinit var webWorkspaceContainer: LinearLayout
+    private lateinit var webUrlInput: EditText
+    private lateinit var webTabChipRow: LinearLayout
+    private lateinit var webViewSlot: FrameLayout
+    private var activeWebView: WebView? = null
+    private var isWebLayerVisible = false
+    private var activeTabIndex = 0
+    private val tabUrls = mutableListOf(
+        "https://www.google.com",
+        "https://m.youtube.com",
+        "https://docs.google.com"
+    )
+    private val tabBundles = arrayOfNulls<Bundle>(3)
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var clockTickRunning = false
+    private val clockTickRunnable = object : Runnable {
+        override fun run() {
+            if (!clockTickRunning) return
+            clockText.text = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            uiHandler.postDelayed(this, 1000L)
+        }
+    }
+
+    @Volatile
+    private var cachedTargetBounds: VerificationTargetBounds? = null
+    private var cursorNormX = 0.5f
+    private var cursorNormY = 0.5f
+    private var lastTouchCoords = "Touch Ready"
+    private var downTimeMs = 0L
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        rootContainer = FrameLayout(context).apply {
+            setBackgroundColor(Color.parseColor("#0B0F17"))
+        }
+
+        val wallpaper = ImageView(context).apply {
+            setImageResource(R.drawable.img_desktop_wallpaper)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            alpha = 0.78f
+        }
+        rootContainer.addView(
+            wallpaper,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // Desktop Workspace Status Card (visible behind freeform native windows)
+        val contentColumn = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(36, 28, 36, 84)
+        }
+        val headerRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleView = TextView(context).apply {
+            text = "EXTENDED DESKTOP // DISPLAY ${display.displayId}"
+            setTextColor(Color.parseColor("#22D3EE"))
+            textSize = 17f
+            typeface = Typeface.MONOSPACE
+        }
+        statusChipText = TextView(context).apply {
+            text = "  •  $modeLabel"
+            setTextColor(Color.parseColor("#10B981"))
+            textSize = 14f
+            typeface = Typeface.MONOSPACE
+        }
+        headerRow.addView(titleView)
+        headerRow.addView(statusChipText)
+        contentColumn.addView(headerRow)
+
+        val inspectorCard = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#CC131A26"))
+            setPadding(24, 20, 24, 20)
+        }
+        desktopInfoText = TextView(context).apply {
+            setTextColor(Color.parseColor("#F1F5F9"))
+            textSize = 14f
+            typeface = Typeface.MONOSPACE
+        }
+        inspectorCard.addView(desktopInfoText)
+        contentColumn.addView(
+            inspectorCard,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 20 }
+        )
+
+        rootContainer.addView(
+            contentColumn,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // Build Stateful WebView Pull-Through Layer (above desktop, below taskbar)
+        buildWebWorkspaceLayer()
+        rootContainer.addView(
+            webWorkspaceContainer,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply { bottomMargin = 64 }
+        )
+
+        // Build DeX App Launcher Overlay (toggled from taskbar ⊞ Apps)
+        buildAppDrawerOverlay()
+        rootContainer.addView(
+            appDrawerOverlay,
+            FrameLayout.LayoutParams(560, 440, Gravity.BOTTOM or Gravity.START).apply {
+                leftMargin = 20
+                bottomMargin = 72
+            }
+        )
+
+        // Bottom DeX Taskbar
+        val taskbar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#F00B0F17"))
+            setPadding(20, 8, 24, 8)
+        }
+        val appsBtn = Button(context).apply {
+            text = "⊞ Apps"
+            setTextColor(Color.parseColor("#0B0F17"))
+            setBackgroundColor(Color.parseColor("#22D3EE"))
+            textSize = 13f
+            setOnClickListener { toggleAppDrawer() }
+        }
+        val webBtn = Button(context).apply {
+            text = "🌐 Web Workspace"
+            setTextColor(Color.parseColor("#F1F5F9"))
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            textSize = 13f
+            setOnClickListener { setWebLayerActive(!isWebLayerVisible) }
+        }
+        val spacer = View(context)
+        clockText = TextView(context).apply {
+            text = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+        }
+        taskbar.addView(appsBtn)
+        taskbar.addView(
+            webBtn,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { leftMargin = 12 }
+        )
+        taskbar.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
+        taskbar.addView(clockText)
+
+        rootContainer.addView(
+            taskbar,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, 64, Gravity.BOTTOM)
+        )
+
+        cursorView = CursorReticleView(context)
+        rootContainer.addView(
+            cursorView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // Diagnostic Touch Target for Hardware Verification Gate
+        val density = context.resources.displayMetrics.density.coerceAtLeast(1f)
+        val targetSidePx = (72f * density).toInt()
+        val diagTarget = View(context).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            isClickable = false
+            isFocusable = false
+            addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+                val w = (right - left).coerceAtLeast(0)
+                val h = (bottom - top).coerceAtLeast(0)
+                if (w > 0 && h > 0) {
+                    cachedTargetBounds = VerificationTargetBounds(
+                        displayId = display.displayId,
+                        widthPx = w,
+                        heightPx = h,
+                        centerXPx = left + w / 2f,
+                        centerYPx = top + h / 2f
+                    )
+                }
+            }
+            @SuppressLint("ClickableViewAccessibility")
+            setOnTouchListener { v, ev ->
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN ||
+                    ev.actionMasked == MotionEvent.ACTION_MOVE ||
+                    ev.actionMasked == MotionEvent.ACTION_UP
+                ) {
+                    onVerificationTouchObserved?.invoke(
+                        ObservedTouchEvent(
+                            displayId = display.displayId,
+                            xPx = ev.x + v.left,
+                            yPx = ev.y + v.top,
+                            timestampMs = System.currentTimeMillis()
+                        )
+                    )
+                }
+                false
+            }
+        }
+        rootContainer.addView(
+            diagTarget,
+            FrameLayout.LayoutParams(targetSidePx, targetSidePx, Gravity.CENTER)
+        )
+
+        setContentView(rootContainer)
+        refreshMetadata()
+
+        // Default to WebView Workspace immediately if Shizuku is not active
+        if (!modeLabel.contains("SHIZUKU", ignoreCase = true)) {
+            setWebLayerActive(true)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        clockTickRunning = true
+        uiHandler.post(clockTickRunnable)
+    }
+
+    override fun onStop() {
+        clockTickRunning = false
+        uiHandler.removeCallbacks(clockTickRunnable)
+        super.onStop()
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun buildWebWorkspaceLayer() {
+        webWorkspaceContainer = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0F172A"))
+            visibility = View.GONE
+            alpha = 0f
+        }
+
+        val navBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            setPadding(12, 8, 12, 8)
+        }
+
+        val backBtn = Button(context).apply {
+            text = "◀"
+            setOnClickListener { if (activeWebView?.canGoBack() == true) activeWebView?.goBack() }
+        }
+        val reloadBtn = Button(context).apply {
+            text = "↻"
+            setOnClickListener { activeWebView?.reload() }
+        }
+        webUrlInput = EditText(context).apply {
+            setText(tabUrls[0])
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            hint = "Enter URL or search…"
+            isSingleLine = true
+            imeOptions = EditorInfo.IME_ACTION_GO
+            setOnEditorActionListener { _, _, _ ->
+                navigateCurrentTab(text.toString())
+                true
+            }
+        }
+        val goBtn = Button(context).apply {
+            text = "Go"
+            setOnClickListener { navigateCurrentTab(webUrlInput.text.toString()) }
+        }
+
+        navBar.addView(backBtn)
+        navBar.addView(reloadBtn)
+        navBar.addView(webUrlInput, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        navBar.addView(goBtn)
+
+        webTabChipRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#0B0F17"))
+            setPadding(12, 4, 12, 4)
+        }
+        rebuildTabChips()
+
+        webViewSlot = FrameLayout(context)
+        webWorkspaceContainer.addView(navBar)
+        webWorkspaceContainer.addView(webTabChipRow)
+        webWorkspaceContainer.addView(
+            webViewSlot,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+    }
+
+    private fun rebuildTabChips() {
+        webTabChipRow.removeAllViews()
+        tabUrls.forEachIndexed { idx, url ->
+            val chip = Button(context).apply {
+                val label = url.removePrefix("https://").removePrefix("www.").take(18)
+                text = "Tab ${idx + 1}: $label"
+                textSize = 11f
+                setTextColor(if (idx == activeTabIndex) Color.parseColor("#0B0F17") else Color.WHITE)
+                setBackgroundColor(
+                    if (idx == activeTabIndex) Color.parseColor("#22D3EE")
+                    else Color.parseColor("#1E293B")
+                )
+                setOnClickListener { switchWebTab(idx) }
+            }
+            webTabChipRow.addView(chip)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun ensureActiveWebView(): WebView {
+        activeWebView?.let { return it }
+        // Uses Presentation's displayId 1 context so Chromium renders desktop layouts at 1280x800 @ 160dpi
+        val wv = WebView(context).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            settings.setSupportZoom(true)
+            settings.builtInZoomControls = true
+            settings.displayZoomControls = false
+            settings.allowFileAccess = false
+            settings.userAgentString =
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    if (!url.isNullOrBlank()) {
+                        tabUrls[activeTabIndex] = url
+                        webUrlInput.setText(url)
+                        rebuildTabChips()
+                    }
+                }
+            }
+            webChromeClient = WebChromeClient()
+        }
+        webViewSlot.removeAllViews()
+        webViewSlot.addView(
+            wv,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        activeWebView = wv
+        val saved = tabBundles[activeTabIndex]
+        if (saved != null) {
+            wv.restoreState(saved)
+        } else {
+            wv.loadUrl(tabUrls[activeTabIndex])
+        }
+        return wv
+    }
+
+    private fun switchWebTab(newIndex: Int) {
+        if (newIndex == activeTabIndex || newIndex !in tabUrls.indices) return
+        activeWebView?.let { wv ->
+            val bundle = Bundle()
+            wv.saveState(bundle)
+            tabBundles[activeTabIndex] = bundle
+            wv.stopLoading()
+        }
+        activeTabIndex = newIndex
+        rebuildTabChips()
+        val wv = ensureActiveWebView()
+        val saved = tabBundles[newIndex]
+        if (saved != null) {
+            wv.restoreState(saved)
+        } else {
+            wv.loadUrl(tabUrls[newIndex])
+        }
+        webUrlInput.setText(tabUrls[newIndex])
+    }
+
+    private fun navigateCurrentTab(rawInput: String) {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) return
+        val targetUrl = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+            trimmed
+        } else if (trimmed.contains('.') && !trimmed.contains(' ')) {
+            "https://$trimmed"
+        } else {
+            "https://www.google.com/search?q=${trimmed.replace(" ", "+")}"
+        }
+        tabUrls[activeTabIndex] = targetUrl
+        ensureActiveWebView().loadUrl(targetUrl)
+    }
+
+    /**
+     * Tier 1 Warm Pause / Resume with 180ms smooth crossfade (zero data loss).
+     */
+    fun setWebLayerActive(active: Boolean) {
+        uiHandler.post {
+            if (active == isWebLayerVisible) return@post
+            isWebLayerVisible = active
+            appDrawerOverlay.visibility = View.GONE
+            if (active) {
+                val wv = ensureActiveWebView()
+                wv.onResume()
+                wv.resumeTimers()
+                webWorkspaceContainer.visibility = View.VISIBLE
+                webWorkspaceContainer.animate().alpha(1f).setDuration(180L).start()
+            } else {
+                activeWebView?.let { wv ->
+                    val bundle = Bundle()
+                    wv.saveState(bundle)
+                    tabBundles[activeTabIndex] = bundle
+                    wv.onPause()
+                    wv.pauseTimers()
+                }
+                webWorkspaceContainer.animate()
+                    .alpha(0f)
+                    .setDuration(180L)
+                    .withEndAction { webWorkspaceContainer.visibility = View.GONE }
+                    .start()
+            }
+            onWorkspaceLayerChanged?.invoke(active)
+        }
+    }
+
+    /**
+     * Tier 2 Cold Bundle Snapshot on low Host RAM: frees Chromium renderer while preserving all tabs.
+     */
+    fun trimWebMemoryToColdBundle() {
+        uiHandler.post {
+            val wv = activeWebView ?: return@post
+            val bundle = Bundle()
+            wv.saveState(bundle)
+            tabBundles[activeTabIndex] = bundle
+            if (!isWebLayerVisible) {
+                webViewSlot.removeAllViews()
+                runCatching {
+                    wv.stopLoading()
+                    wv.onPause()
+                    wv.destroy()
+                }
+                activeWebView = null
+            }
+        }
+    }
+
+    fun releaseWebResources() {
+        uiHandler.post {
+            activeWebView?.let { wv ->
+                runCatching {
+                    wv.stopLoading()
+                    wv.onPause()
+                    wv.destroy()
+                }
+            }
+            activeWebView = null
+        }
+    }
+
+    private fun buildAppDrawerOverlay() {
+        appDrawerOverlay = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#F5131A26"))
+            setPadding(20, 16, 20, 16)
+            visibility = View.GONE
+        }
+        val drawerHeader = TextView(context).apply {
+            text = "NATIVE APPS (FREEFORM DESKTOP WINDOWS)"
+            setTextColor(Color.parseColor("#22D3EE"))
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+        }
+        appDrawerOverlay.addView(drawerHeader)
+
+        val scroll = ScrollView(context)
+        appDrawerGrid = GridLayout(context).apply {
+            columnCount = 3
+        }
+        scroll.addView(appDrawerGrid)
+        appDrawerOverlay.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            ).apply { topMargin = 12 }
+        )
+    }
+
+    fun updateLaunchableApps(apps: List<InstalledAppInfo>) {
+        availableApps = apps
+        uiHandler.post { rebuildAppDrawerGrid() }
+    }
+
+    private fun toggleAppDrawer() {
+        appDrawerOverlay.visibility =
+            if (appDrawerOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        if (appDrawerOverlay.visibility == View.VISIBLE) {
+            rebuildAppDrawerGrid()
+        }
+    }
+
+    private fun rebuildAppDrawerGrid() {
+        appDrawerGrid.removeAllViews()
+        availableApps.take(24).forEach { app ->
+            val btn = Button(context).apply {
+                text = app.label.take(14)
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.parseColor("#1E293B"))
+                setOnClickListener {
+                    appDrawerOverlay.visibility = View.GONE
+                    setWebLayerActive(false)
+                    onLaunchAppFromTaskbar?.invoke(app.packageName)
+                }
+            }
+            appDrawerGrid.addView(btn)
+        }
+    }
+
+    /**
+     * Direct in-process touch dispatch for WebView & Taskbar when Shizuku is off or Web layer is active.
+     */
+    fun injectInProcessTouch(action: Byte, normX: Float, normY: Float) {
+        uiHandler.post {
+            val w = rootContainer.width.coerceAtLeast(config.targetWidth).toFloat()
+            val h = rootContainer.height.coerceAtLeast(config.targetHeight).toFloat()
+            val xPx = normX.coerceIn(0f, 1f) * w
+            val yPx = normY.coerceIn(0f, 1f) * h
+            val now = SystemClock.uptimeMillis()
+
+            val motionAction = when (action) {
+                TouchSample.ACTION_DOWN -> {
+                    downTimeMs = now
+                    MotionEvent.ACTION_DOWN
+                }
+                TouchSample.ACTION_UP -> MotionEvent.ACTION_UP
+                else -> MotionEvent.ACTION_MOVE
+            }
+            val ev = MotionEvent.obtain(downTimeMs, now, motionAction, xPx, yPx, 0)
+            try {
+                rootContainer.dispatchTouchEvent(ev)
+            } finally {
+                ev.recycle()
+            }
+        }
+    }
+
+    fun getVerificationTargetBounds(): VerificationTargetBounds? = cachedTargetBounds
+
+    fun updateConfig(newConfig: VirtualDisplayConfig, newModeLabel: String) {
+        config = newConfig
+        modeLabel = newModeLabel
+        uiHandler.post { refreshMetadata() }
+    }
+
+    fun updateCursor(normX: Float, normY: Float, actionLabel: String) {
+        cursorNormX = normX.coerceIn(0f, 1f)
+        cursorNormY = normY.coerceIn(0f, 1f)
+        lastTouchCoords = "$actionLabel (${(cursorNormX * config.targetWidth).toInt()}, ${(cursorNormY * config.targetHeight).toInt()})"
+        uiHandler.post {
+            cursorView.setPosition(cursorNormX, cursorNormY)
+            refreshMetadata()
+        }
+    }
+
+    fun appendImeText(textInput: String?, keyCode: Int) {
+        uiHandler.post {
+            if (isWebLayerVisible && activeWebView != null) {
+                when {
+                    keyCode == KeyEvent.KEYCODE_ENTER -> {
+                        if (webUrlInput.hasFocus()) {
+                            navigateCurrentTab(webUrlInput.text.toString())
+                        } else {
+                            activeWebView?.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                            activeWebView?.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+                        }
+                    }
+                    keyCode == KeyEvent.KEYCODE_DEL -> {
+                        if (webUrlInput.hasFocus() && webUrlInput.text.isNotEmpty()) {
+                            webUrlInput.text.delete(webUrlInput.text.length - 1, webUrlInput.text.length)
+                        } else {
+                            activeWebView?.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL))
+                            activeWebView?.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL))
+                        }
+                    }
+                    !textInput.isNullOrEmpty() -> {
+                        if (webUrlInput.hasFocus()) {
+                            webUrlInput.append(textInput)
+                        } else {
+                            val escaped = textInput.replace("\\", "\\\\").replace("'", "\\'")
+                            activeWebView?.evaluateJavascript(
+                                "if(document.activeElement && 'value' in document.activeElement){document.activeElement.value+='$escaped';}",
+                                null
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun refreshMetadata() {
+        val layoutMode = if (config.forceTabletLayout) "Tablet / Desktop" else "Phone Scaled"
+        val wifiBand = if (config.is24GhzAdapted) "2.4 GHz CBR" else "5 GHz / High"
+        desktopInfoText.text =
+            "Resolution: ${config.targetWidth} x ${config.targetHeight} · ${config.targetDpi} dpi ($layoutMode)\n" +
+                "Stream: ${config.bitrateMbps} Mbps ($wifiBand) · Input: $lastTouchCoords"
+        statusChipText.text = "  •  $modeLabel"
+    }
+
+    private class CursorReticleView(context: Context) : View(context) {
+        private var normX = 0.5f
+        private var normY = 0.5f
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#22D3EE")
+            style = Paint.Style.FILL
+        }
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+
+        fun setPosition(nx: Float, ny: Float) {
+            normX = nx
+            normY = ny
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = normX * width
+            val cy = normY * height
+            canvas.drawCircle(cx, cy, 10f, fillPaint)
+            canvas.drawCircle(cx, cy, 12f, ringPaint)
+        }
+    }
+}
+
+B. Route Touch & Memory Pressure in HostSessionEngine.kt
+In HostSessionEngine.kt:
+ * Track @Volatile private var webLayerActive = !shizukuController.isAuthorized() and pass onLaunchAppFromTaskbar = { pkg -> launchAppExclusive(pkg) } + onWorkspaceLayerChanged = { active -> webLayerActive = active; encoder?.requestSyncFrameBurst() } when constructing VirtualDisplayPresentation.
+ * Call pres.updateLaunchableApps(shizukuController.listLaunchableApps(emptySet(), emptySet())) right after pres.show() so the tablet taskbar's ⊞ Apps button is immediately populated.
+ * In readControlLoop (BinaryTouch) and sendTrackpadDelta, route to presentation?.injectInProcessTouch(...) whenever webLayerActive || !shizukuController.isAuthorized(), and otherwise call shizukuController.injectTouchOnDisplay(...).
+ * In startAdvisorLoop(), if sample.freeRamPercent < 25 and !webLayerActive, call presentation?.trimWebMemoryToColdBundle(); and in disconnectInternal(), call oldPres?.releaseWebResources() before oldPres?.dismiss().
+4. Eliminate Android 7 DT_TEXTREL Dialog on Galaxy Tab 2 (app/build.gradle.kts)
+Add a productFlavors block in app/build.gradle.kts so you can install displayLegacy (targetSdk = 22) on your modded Galaxy Tab 2 while keeping hostModern (targetSdk = 34) for your Android 10+ Host:
+android {
+    // ... existing defaultConfig ...
+    flavorDimensions += "deviceTier"
+    productFlavors {
+        create("hostModern") {
+            dimension = "deviceTier"
+            targetSdk = 34
+        }
+        create("displayLegacy") {
+            dimension = "deviceTier"
+            // Bypasses Android 7's DT_TEXTREL dialog on PowerVR SGX544 vendor libs
+            targetSdk = 22
+        }
+    }
+}
+
+On-Device Verification Checklist
+ * Install Both Flavors: Build and install hostModernDebug on your Android 10+ Host and displayLegacyDebug on your Galaxy Tab 2. Cold-launch the tablet—the standby screen opens immediately with zero text-relocation dialog.
+ * Verify Live Stream & Stateful WebView (Zero ADB): Connect from the Host over Same Wi-Fi. Within 1 second, the tablet renders the desktop workspace at 25–60 FPS with the live ticking clock, and tapping/typing on the tablet browses desktop sites in 🌐 Web Workspace.
+ * Activate Full Native DeX Freeform Windows: Start Shizuku via USB ADB on the Host, tap ⊞ Apps on the tablet's bottom taskbar, and launch two native apps (e.g., Brave + Files). Both open on displayId 1 as resizable, overlapping tablet-mode windows (--windowingMode 5) while your WebView tabs stay paused in RAM for instant pull-back.

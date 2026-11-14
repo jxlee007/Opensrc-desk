@@ -682,4 +682,100 @@ class ExtendedDesktopUnitTest {
             )
         )
     }
+
+    @Test
+    fun shizukuDesktopUserServiceBuildsFreeformAndFallbackLaunchCommands() {
+        val freeformCmd = com.example.host.ShizukuDesktopUserService.buildFreeformLaunchCommand(
+            safePkg = "com.example.browser",
+            safeComp = "com.example.browser/.MainActivity",
+            displayId = 2
+        ).joinToString(" ")
+        assertTrue(freeformCmd.contains("--display 2"))
+        assertTrue(freeformCmd.contains("--windowingMode 5"))
+        assertTrue(freeformCmd.contains("com.example.browser/.MainActivity"))
+
+        val fallbackCmd = com.example.host.ShizukuDesktopUserService.buildFallbackLaunchCommand(
+            safePkg = "com.example.browser",
+            safeComp = "com.example.browser/.MainActivity",
+            displayId = 2
+        ).joinToString(" ")
+        assertTrue(fallbackCmd.contains("--display 2"))
+        assertFalse(fallbackCmd.contains("--windowingMode"))
+        assertTrue(fallbackCmd.contains("com.example.browser/.MainActivity"))
+    }
+
+    @Test
+    fun desktopShellBridgeFilterLaunchableAppsSupportsSearchAndShowsAllAppsOver24() {
+        val apps = (1..35).map { idx ->
+            com.example.model.InstalledAppInfo(
+                packageName = "com.vendor.app$idx",
+                label = if (idx == 33) "Chromium Canary" else "Utility $idx"
+            )
+        }
+        val all = com.example.host.DesktopShellBridge.filterLaunchableApps(apps, "")
+        assertEquals(35, all.size)
+
+        val byLabel = com.example.host.DesktopShellBridge.filterLaunchableApps(apps, "chromium")
+        assertEquals(listOf("com.vendor.app33"), byLabel.map { it.packageName })
+
+        val byPkg = com.example.host.DesktopShellBridge.filterLaunchableApps(apps, "app19")
+        assertEquals(listOf("com.vendor.app19"), byPkg.map { it.packageName })
+    }
+
+    @Test
+    fun desktopShellBridgeTouchRoutingBranchesBetweenInProcessAndNativeDisplay() {
+        // Without Shizuku -> always in-process
+        assertTrue(
+            com.example.host.DesktopShellBridge.shouldRouteTouchInProcess(
+                webLayerActive = false,
+                appDrawerVisible = false,
+                normY = 0.5f,
+                shizukuAuthorized = false
+            )
+        )
+        // Web Workspace active -> in-process
+        assertTrue(
+            com.example.host.DesktopShellBridge.shouldRouteTouchInProcess(
+                webLayerActive = true,
+                appDrawerVisible = false,
+                normY = 0.4f,
+                shizukuAuthorized = true
+            )
+        )
+        // App Drawer open -> in-process
+        assertTrue(
+            com.example.host.DesktopShellBridge.shouldRouteTouchInProcess(
+                webLayerActive = false,
+                appDrawerVisible = true,
+                normY = 0.3f,
+                shizukuAuthorized = true
+            )
+        )
+        // Bottom taskbar zone -> in-process
+        assertTrue(
+            com.example.host.DesktopShellBridge.shouldRouteTouchInProcess(
+                webLayerActive = false,
+                appDrawerVisible = false,
+                normY = 0.96f,
+                shizukuAuthorized = true
+            )
+        )
+        // Native freeform app zone above taskbar with Shizuku active -> route via Shizuku
+        assertFalse(
+            com.example.host.DesktopShellBridge.shouldRouteTouchInProcess(
+                webLayerActive = false,
+                appDrawerVisible = false,
+                normY = 0.50f,
+                shizukuAuthorized = true
+            )
+        )
+    }
+
+    @Test
+    fun desktopShellBridgeExpectedDisplayMatchChecksForOemDisplay0Leak() {
+        assertTrue(com.example.host.DesktopShellBridge.isExpectedDisplayMatch(expectedDisplayId = 2, actualDisplayId = 2))
+        assertFalse(com.example.host.DesktopShellBridge.isExpectedDisplayMatch(expectedDisplayId = 2, actualDisplayId = 0))
+        assertFalse(com.example.host.DesktopShellBridge.isExpectedDisplayMatch(expectedDisplayId = 2, actualDisplayId = null))
+    }
 }
+

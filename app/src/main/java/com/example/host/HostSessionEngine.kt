@@ -94,7 +94,9 @@ class HostSessionEngine(
 
     private var encoder: H264StreamEncoder? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var presentation: VirtualDisplayPresentation? = null
+
+    @Volatile
+    private var launchableAppsCache: List<com.example.model.InstalledAppInfo> = emptyList()
 
     private val observedVirtualDisplayTouches = Collections.synchronizedList(mutableListOf<ObservedTouchEvent>())
     private val pendingProbeTimestamp = AtomicLong(0L)
@@ -550,9 +552,15 @@ class HostSessionEngine(
 
                 sock.soTimeout = PairingCrypto.STREAM_SO_TIMEOUT_MS.toInt()
 
+                val shizukuAuth = shizukuController.isAuthorized()
+                if (shizukuAuth) {
+                    shizukuController.enableFreeformDesktopSupport()
+                }
+                launchableAppsCache = shizukuController.listLaunchableApps(emptySet(), emptySet())
+
                 val initialAdvisory = advisor.sample(
                     displayAppsCount = 0,
-                    shizukuAuthorized = shizukuController.isAuthorized()
+                    shizukuAuthorized = shizukuAuth
                 )
                 ExtendedDesktopService.startHost(context, initialAdvisory)
 
@@ -624,9 +632,9 @@ class HostSessionEngine(
         _telemetry.value = _telemetry.value.copy(config = newConfig)
 
         val modeLabel = if (shizukuController.isAuthorized()) "SHIZUKU FULL" else "LAYOUT PREVIEW"
+        DesktopShellBridge.updateConfig(newConfig, modeLabel)
         mainHandler.post {
             virtualDisplay?.resize(newConfig.targetWidth, newConfig.targetHeight, newConfig.targetDpi)
-            presentation?.updateConfig(newConfig, modeLabel)
         }
         val out = controlOut ?: return
         scope.launch {
@@ -634,6 +642,15 @@ class HostSessionEngine(
                 ControlCodec.writeJsonFrame(out, ControlMessage.DisplayOverride(newConfig))
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    fun focusDesktopShell() {
+        val displayId = virtualDisplay?.display?.displayId ?: return
+        mainHandler.post {
+            DesktopShellActivity.launchOnDisplay(context, displayId, diagnosticOnly = false)
+                .onFailure { err -> DesktopShellBridge.reportLaunchException(displayId, err) }
+            encoder?.requestSyncFrameBurst()
         }
     }
 
@@ -646,15 +663,28 @@ class HostSessionEngine(
             TouchSample.ACTION_RIGHT_CLICK -> "Right Click"
             else -> "Trackpad"
         }
-        presentation?.updateCursor(cursorX, cursorY, label)
+        handlePointerInput(action, cursorX, cursorY, label)
+    }
+
+    private fun handlePointerInput(action: Byte, normX: Float, normY: Float, label: String) {
+        DesktopShellBridge.updateCursor(normX, normY, label)
         val displayId = virtualDisplay?.display?.displayId
         val cfg = currentConfig
-        if (displayId != null && cfg != null && shizukuController.isAuthorized()) {
+        val shizukuAuth = shizukuController.isAuthorized()
+        val routeInProcess = DesktopShellBridge.shouldRouteTouchInProcess(
+            webLayerActive = DesktopShellBridge.webLayerActive,
+            appDrawerVisible = DesktopShellBridge.appDrawerVisible,
+            normY = normY,
+            shizukuAuthorized = shizukuAuth
+        )
+        if (routeInProcess) {
+            DesktopShellBridge.injectInProcessTouch(action, normX, normY)
+        } else if (displayId != null && cfg != null && shizukuAuth) {
             shizukuController.injectTouchOnDisplay(
                 displayId = displayId,
                 action = action,
-                xPx = cursorX * cfg.targetWidth,
-                yPx = cursorY * cfg.targetHeight
+                xPx = normX * cfg.targetWidth,
+                yPx = normY * cfg.targetHeight
             )
             _telemetry.value = _telemetry.value.copy(
                 inputBackendStatus = shizukuController.inputBackendStatus.value
@@ -664,9 +694,13 @@ class HostSessionEngine(
     }
 
     fun sendImeInput(textInput: String?, keyCode: Int) {
-        presentation?.appendImeText(textInput, keyCode)
+        DesktopShellBridge.appendImeText(textInput, keyCode)
         val displayId = virtualDisplay?.display?.displayId
-        if (displayId != null && shizukuController.isAuthorized()) {
+        if (displayId != null &&
+            shizukuController.isAuthorized() &&
+            !DesktopShellBridge.webLayerActive &&
+            !DesktopShellBridge.appDrawerVisible
+        ) {
             shizukuController.injectKeyOrTextOnDisplay(displayId, textInput, keyCode)
         }
         encoder?.requestSyncFrameBurst()
@@ -728,8 +762,8 @@ class HostSessionEngine(
 
     /**
      * Runs the 2s baseline + VirtualDisplay target receipt gate using REAL observed MotionEvents
-     * from VirtualDisplayPresentation (`displayId != 0`). If no active peer VirtualDisplay exists,
-     * creates a temporary local diagnostic VirtualDisplay + Presentation and tears it down
+     * from [DesktopShellActivity] (`displayId != 0`). If no active peer VirtualDisplay exists,
+     * creates a temporary local diagnostic VirtualDisplay + DesktopShellActivity and tears it down
      * immediately after the 1.5s receipt window. Never synthesizes mock virtual-display hits.
      */
     suspend fun runInputReceiptGateDiagnostic(
@@ -739,25 +773,19 @@ class HostSessionEngine(
     ): InputReceiptEvaluation {
         var tempReader: ImageReader? = null
         var tempVd: VirtualDisplay? = null
-        var tempPres: VirtualDisplayPresentation? = null
         val createdTemporaryDisplay: Boolean
 
         val activeVd = virtualDisplay
-        val activePres = presentation
-        val diagPresentation: VirtualDisplayPresentation?
         val diagDisplayId: Int
 
-        if (activeVd != null && activePres != null) {
+        if (activeVd != null && DesktopShellBridge.verifiedDisplayId != null) {
             createdTemporaryDisplay = false
-            diagPresentation = activePres
             diagDisplayId = activeVd.display.displayId
         } else {
             createdTemporaryDisplay = true
             val created = createTemporaryDiagnosticDisplay()
             tempReader = created.reader
             tempVd = created.virtualDisplay
-            tempPres = created.presentation
-            diagPresentation = created.presentation
             diagDisplayId = created.virtualDisplay?.display?.displayId ?: 1
         }
 
@@ -769,7 +797,14 @@ class HostSessionEngine(
             val baselineDisplay0 = collectBaselineDisplay0()
             clearDisplay0Buffer()
 
-            val bounds = diagPresentation?.getVerificationTargetBounds()
+            var bounds = DesktopShellBridge.getVerificationTargetBounds()
+            if (bounds == null) {
+                repeat(20) {
+                    delay(50L)
+                    bounds = DesktopShellBridge.getVerificationTargetBounds()
+                    if (bounds != null) return@repeat
+                }
+            }
             val targetWidthPx = bounds?.widthPx ?: 144
             val targetHeightPx = bounds?.heightPx ?: 144
             val injectXPx = bounds?.centerXPx ?: 400f
@@ -777,7 +812,12 @@ class HostSessionEngine(
             val targetDisplayId = bounds?.displayId ?: diagDisplayId
 
             val tInject = System.currentTimeMillis()
-            if (diagVdReady(diagPresentation, createdTemporaryDisplay, tempVd) && shizukuController.isAuthorized()) {
+            val shellReady = if (createdTemporaryDisplay) {
+                tempVd != null && DesktopShellBridge.verifiedDisplayId != null
+            } else {
+                virtualDisplay != null && DesktopShellBridge.verifiedDisplayId != null
+            }
+            if (shellReady && shizukuController.isAuthorized()) {
                 shizukuController.injectTouchOnDisplay(
                     displayId = targetDisplayId,
                     action = TouchSample.ACTION_DOWN,
@@ -810,21 +850,14 @@ class HostSessionEngine(
             )
         } finally {
             if (createdTemporaryDisplay) {
-                releaseTemporaryDiagnosticDisplay(tempPres, tempVd, tempReader)
+                releaseTemporaryDiagnosticDisplay(tempVd, tempReader)
             }
         }
     }
 
-    private fun diagVdReady(
-        pres: VirtualDisplayPresentation?,
-        isTemp: Boolean,
-        tempVd: VirtualDisplay?
-    ): Boolean = if (isTemp) (tempVd != null && pres != null) else (virtualDisplay != null && pres != null)
-
     private data class TempDiagnosticDisplay(
         val reader: ImageReader?,
-        val virtualDisplay: VirtualDisplay?,
-        val presentation: VirtualDisplayPresentation?
+        val virtualDisplay: VirtualDisplay?
     )
 
     private suspend fun createTemporaryDiagnosticDisplay(): TempDiagnosticDisplay {
@@ -855,17 +888,30 @@ class HostSessionEngine(
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
                         DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
                 )
-                val pres = VirtualDisplayPresentation(
-                    context = context,
-                    display = vd.display,
+                val targetDisplayId = vd.display.displayId
+                DesktopShellBridge.prepareSession(
+                    expectedDisplayId = targetDisplayId,
                     config = cfg,
                     modeLabel = "DIAGNOSTIC PROBE",
-                    onVerificationTouchObserved = { ev -> observedVirtualDisplayTouches.add(ev) }
+                    shizukuAuthorized = shizukuController.isAuthorized(),
+                    apps = emptyList(),
+                    diagnosticOnly = true,
+                    shellCallbacks = object : DesktopShellBridge.ShellCallbacks {
+                        override fun onLaunchAppFromTaskbar(packageName: String) = Unit
+                        override fun onWorkspaceLayerChanged(webLayerActive: Boolean) = Unit
+                        override fun onDrawerVisibilityChanged(visible: Boolean) = Unit
+                        override fun onShellDisplayVerified(displayId: Int) = Unit
+                        override fun onShellDisplayRejected(expectedDisplayId: Int, actualDisplayId: Int?) = Unit
+                        override fun onVerificationTouchObserved(event: ObservedTouchEvent) {
+                            observedVirtualDisplayTouches.add(event)
+                        }
+                    }
                 )
-                pres.show()
-                deferred.complete(TempDiagnosticDisplay(reader, vd, pres))
+                DesktopShellActivity.launchOnDisplay(context, targetDisplayId, diagnosticOnly = true)
+                    .onFailure { err -> DesktopShellBridge.reportLaunchException(targetDisplayId, err) }
+                deferred.complete(TempDiagnosticDisplay(reader, vd))
             } catch (_: Throwable) {
-                deferred.complete(TempDiagnosticDisplay(null, null, null))
+                deferred.complete(TempDiagnosticDisplay(null, null))
             }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -873,16 +919,15 @@ class HostSessionEngine(
         } else {
             mainHandler.post(spawn)
         }
-        return withTimeoutOrNull(2_000L) { deferred.await() } ?: TempDiagnosticDisplay(null, null, null)
+        return withTimeoutOrNull(2_000L) { deferred.await() } ?: TempDiagnosticDisplay(null, null)
     }
 
     private fun releaseTemporaryDiagnosticDisplay(
-        pres: VirtualDisplayPresentation?,
         vd: VirtualDisplay?,
         reader: ImageReader?
     ) {
         val cleanup = Runnable {
-            runCatching { pres?.dismiss() }
+            runCatching { DesktopShellBridge.releaseAndCloseShell() }
             runCatching { vd?.release() }
             runCatching { reader?.close() }
         }
@@ -902,6 +947,9 @@ class HostSessionEngine(
                     displayAppsCount = appCount,
                     shizukuAuthorized = shizukuController.isAuthorized()
                 )
+                if (sample.freeRamPercent < 25 && !DesktopShellBridge.webLayerActive) {
+                    DesktopShellBridge.trimWebMemoryToColdBundle()
+                }
                 val hostForeground = if (shizukuController.isAuthorized()) {
                     shizukuController.queryActiveHostPackages()
                 } else {
@@ -921,9 +969,7 @@ class HostSessionEngine(
     fun handleShizukuLostMidStream() {
         if (!_telemetry.value.connected) return
         val cfg = currentConfig ?: return
-        mainHandler.post {
-            presentation?.updateConfig(cfg, "LAYOUT PREVIEW (RECOVERED)")
-        }
+        DesktopShellBridge.updateConfig(cfg, "LAYOUT PREVIEW (RECOVERED)")
         _telemetry.value = _telemetry.value.copy(
             statusNote = "Shizuku stopped — seamlessly switched to Layout Preview",
             inputBackendStatus = InputBackendStatus.PREVIEW_CURSOR_ONLY
@@ -958,7 +1004,6 @@ class HostSessionEngine(
         val oldVidSock: Socket?
         val oldVidSrv: ServerSocket?
         val oldEncoder: H264StreamEncoder?
-        val oldPres: VirtualDisplayPresentation?
         val oldVd: VirtualDisplay?
 
         synchronized(socketLock) {
@@ -969,7 +1014,6 @@ class HostSessionEngine(
             oldVidSock = videoSocket
             oldVidSrv = videoServerSocket
             oldEncoder = encoder
-            oldPres = presentation
             oldVd = virtualDisplay
             controlOut = null
             controlSocket = null
@@ -977,12 +1021,11 @@ class HostSessionEngine(
             videoSocket = null
             videoServerSocket = null
             encoder = null
-            presentation = null
             virtualDisplay = null
         }
 
         mainHandler.post {
-            runCatching { oldPres?.dismiss() }
+            runCatching { DesktopShellBridge.releaseAndCloseShell() }
             runCatching { oldVd?.release() }
         }
 
@@ -1047,6 +1090,11 @@ class HostSessionEngine(
         )
         encoder = enc
         val surface = enc.start()
+        val apps = launchableAppsCache.ifEmpty {
+            shizukuController.listLaunchableApps(emptySet(), emptySet()).also {
+                launchableAppsCache = it
+            }
+        }
 
         mainHandler.post {
             val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -1060,16 +1108,52 @@ class HostSessionEngine(
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             )
             virtualDisplay = vd
-            val pres = VirtualDisplayPresentation(
-                context = context,
-                display = vd.display,
+            val displayId = vd.display.displayId
+            val shizukuAuth = shizukuController.isAuthorized()
+            DesktopShellBridge.prepareSession(
+                expectedDisplayId = displayId,
                 config = config,
                 modeLabel = modeLabel,
-                onVerificationTouchObserved = { ev -> observedVirtualDisplayTouches.add(ev) }
+                shizukuAuthorized = shizukuAuth,
+                apps = apps,
+                diagnosticOnly = false,
+                shellCallbacks = object : DesktopShellBridge.ShellCallbacks {
+                    override fun onLaunchAppFromTaskbar(packageName: String) {
+                        scope.launch(Dispatchers.IO) {
+                            launchAppExclusive(packageName)
+                        }
+                    }
+
+                    override fun onWorkspaceLayerChanged(webLayerActive: Boolean) {
+                        encoder?.requestSyncFrameBurst()
+                    }
+
+                    override fun onDrawerVisibilityChanged(visible: Boolean) {
+                        encoder?.requestSyncFrameBurst()
+                    }
+
+                    override fun onShellDisplayVerified(displayId: Int) {
+                        _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
+                        encoder?.requestSyncFrameBurst()
+                    }
+
+                    override fun onShellDisplayRejected(expectedDisplayId: Int, actualDisplayId: Int?) {
+                        val msg =
+                            "Display $expectedDisplayId launch blocked on this ROM (landed on Display ${actualDisplayId ?: -1})"
+                        _telemetry.value = _telemetry.value.copy(
+                            statusNote = msg,
+                            securityNotice = _telemetry.value.securityNotice ?: msg
+                        )
+                    }
+
+                    override fun onVerificationTouchObserved(event: ObservedTouchEvent) {
+                        observedVirtualDisplayTouches.add(event)
+                    }
+                }
             )
-            pres.show()
-            presentation = pres
-            _telemetry.value = _telemetry.value.copy(virtualDisplayId = vd.display.displayId)
+            DesktopShellActivity.launchOnDisplay(context, displayId, diagnosticOnly = false)
+                .onFailure { err -> DesktopShellBridge.reportLaunchException(displayId, err) }
+            _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
         }
     }
 
@@ -1091,20 +1175,10 @@ class HostSessionEngine(
                         val actionStr = when (reusableSample.action) {
                             TouchSample.ACTION_DOWN -> "Down"
                             TouchSample.ACTION_UP -> "Up"
+                            TouchSample.ACTION_RIGHT_CLICK -> "Right Click"
                             else -> "Move"
                         }
-                        presentation?.updateCursor(cursorX, cursorY, actionStr)
-                        val displayId = virtualDisplay?.display?.displayId
-                        val cfg = currentConfig
-                        if (displayId != null && cfg != null && shizukuController.isAuthorized()) {
-                            shizukuController.injectTouchOnDisplay(
-                                displayId = displayId,
-                                action = reusableSample.action,
-                                xPx = cursorX * cfg.targetWidth,
-                                yPx = cursorY * cfg.targetHeight
-                            )
-                        }
-                        encoder?.requestSyncFrameBurst()
+                        handlePointerInput(reusableSample.action, cursorX, cursorY, actionStr)
                     }
                 }
                 is ControlCodec.DecodedFrame.JsonControl -> {
@@ -1112,6 +1186,14 @@ class HostSessionEngine(
                         is ControlMessage.LatencyProbe -> {
                             pendingProbeTimestamp.set(msg.timestampMs)
                             encoder?.requestSyncFrameBurst()
+                        }
+                        is ControlMessage.KeyEventMsg -> {
+                            sendImeInput(msg.textInput, msg.keyCode)
+                        }
+                        is ControlMessage.LaunchApp -> {
+                            scope.launch(Dispatchers.IO) {
+                                launchAppExclusive(msg.packageName)
+                            }
                         }
                         is ControlMessage.HeartbeatPing -> {
                             ControlCodec.writeJsonFrame(out, ControlMessage.HeartbeatAck(msg.timestampMs))

@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Tune
@@ -84,6 +85,7 @@ fun HostControllerScreen(
     onUpdateDisplay: (ResolutionCeiling, Boolean, Int, Boolean) -> Unit,
     onLaunchApp: (String) -> Unit,
     onMoveAppBackToHost: (String) -> Unit = {},
+    onFocusDesktopShell: () -> Unit = {},
     onRequestShizukuPermission: () -> Unit,
     onRefreshShizuku: () -> Unit,
     onDisconnect: () -> Unit
@@ -124,6 +126,16 @@ fun HostControllerScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = onFocusDesktopShell,
+                        modifier = Modifier.testTag("focus_desktop_shell_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Home,
+                            contentDescription = "Focus Desktop Shell on Display 1",
+                            tint = CyanPrimary
+                        )
+                    }
                     IconButton(
                         onClick = onDisconnect,
                         modifier = Modifier.testTag("host_disconnect_button")
