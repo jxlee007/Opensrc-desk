@@ -234,6 +234,9 @@ class WorkstationRuntime private constructor(appContext: Context) {
         hostEngine.onHostForegroundPackagesUpdated = { pkgs ->
             activeHostPackages.value = pkgs
         }
+        hostEngine.onModeBannerMessage = { msg ->
+            bannerMessage.value = msg
+        }
         runtimeScope.launch {
             peerStore.ensureSchemaV2Migrated()
             val id = peerStore.getOrCreateDeviceId()
@@ -289,6 +292,31 @@ class WorkstationRuntime private constructor(appContext: Context) {
                 activeHostPackages.value = shizukuController.queryActiveHostPackages()
             }
         }
+    }
+
+    fun startHostMirroring(resultCode: Int, data: android.content.Intent) {
+        runtimeScope.launch {
+            val ok = hostEngine.switchToMirrorMode(resultCode, data)
+            if (!ok) {
+                bannerMessage.value = "Could not start Host Screen Mirroring — staying in Extended Desktop"
+            }
+        }
+    }
+
+    fun stopHostMirroring() {
+        hostEngine.switchToExtendedDesktopMode(fromSystemStop = false)
+    }
+
+    fun setMirrorRightClickAsBack(enabled: Boolean) {
+        hostEngine.setMirrorRightClickAsBack(enabled)
+    }
+
+    fun setMirrorAspectFallback(enabled: Boolean) {
+        hostEngine.setMirrorAspectFallback(enabled)
+    }
+
+    fun showBanner(message: String) {
+        bannerMessage.value = message
     }
 
     fun connectToTrustedPeer(

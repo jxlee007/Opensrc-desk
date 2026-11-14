@@ -777,5 +777,130 @@ class ExtendedDesktopUnitTest {
         assertFalse(com.example.host.DesktopShellBridge.isExpectedDisplayMatch(expectedDisplayId = 2, actualDisplayId = 0))
         assertFalse(com.example.host.DesktopShellBridge.isExpectedDisplayMatch(expectedDisplayId = 2, actualDisplayId = null))
     }
+
+    @Test
+    fun shizukuDesktopUserServiceParsesDisplay0AndVirtualDisplayPackagesFromStackList() {
+        val stackListOutput = """
+            Stack #0: type=home mode=fullscreen isSleeping=false
+              displayId=0
+              * Task{101 #101 type=home A=1000:com.android.launcher3 U=0 visible=true}
+                realActivity=com.android.launcher3/.Launcher
+              * Task{102 #102 type=standard A=10123:com.whatsapp U=0 visible=true}
+                realActivity=com.whatsapp/.HomeActivity
+            RootTask #4: type=standard mode=freeform displayId=2 bounds=[0,0][1280,800]
+              * Task{205 #205 type=standard A=10210:org.mozilla.firefox U=0 visible=true}
+                topActivity=ComponentInfo{org.mozilla.firefox/.App}
+            Display #3
+              * Task{309 #309 type=standard A=10211:com.Slack U=0 visible=true}
+                realActivity=com.Slack/slack.features.home.HomeActivity
+            Stack #1: type=standard mode=fullscreen
+              * Task{109 #109 type=standard A=10001:com.android.settings U=0 visible=true}
+                realActivity=com.android.settings/.Settings
+        """.trimIndent()
+
+        val display0Pkgs = com.example.host.ShizukuDesktopUserService.parsePackagesFromStackList(stackListOutput) {
+            it == 0
+        }
+        assertEquals(setOf("com.whatsapp", "com.android.settings"), display0Pkgs)
+
+        val virtualPkgs = com.example.host.ShizukuDesktopUserService.parsePackagesFromStackList(stackListOutput) {
+            it > 0
+        }
+        assertEquals(setOf("org.mozilla.firefox", "com.Slack"), virtualPkgs)
+    }
+
+    @Test
+    fun mirrorGeometryComputesCenteredFitBoundsForPortraitWideAndMatchedHosts() {
+        // Portrait phone (1080x2400 -> 0.45) inside 1280x800 (1.6) -> pillarboxed
+        val pillarboxed = com.example.host.MirrorGeometry.computeCenteredFitBounds(
+            hostWidthPx = 1080,
+            hostHeightPx = 2400,
+            encoderWidthPx = 1280,
+            encoderHeightPx = 800
+        )
+        val expectedNormWidth = (1080f / 2400f) / (1280f / 800f) // 0.28125
+        val expectedMarginX = (1f - expectedNormWidth) * 0.5f
+        assertEquals(expectedMarginX, pillarboxed.normLeft, 0.0005f)
+        assertEquals(1f - expectedMarginX, pillarboxed.normRight, 0.0005f)
+        assertEquals(0f, pillarboxed.normTop, 0.0001f)
+        assertEquals(1f, pillarboxed.normBottom, 0.0001f)
+
+        // Wide landscape host (2560x1080 -> 2.370) inside 1280x800 (1.6) -> letterboxed
+        val letterboxed = com.example.host.MirrorGeometry.computeCenteredFitBounds(
+            hostWidthPx = 2560,
+            hostHeightPx = 1080,
+            encoderWidthPx = 1280,
+            encoderHeightPx = 800
+        )
+        assertEquals(0f, letterboxed.normLeft, 0.0001f)
+        assertEquals(1f, letterboxed.normRight, 0.0001f)
+        assertTrue(letterboxed.normTop > 0.1f && letterboxed.normTop < 0.25f)
+        assertEquals(1f - letterboxed.normTop, letterboxed.normBottom, 0.0005f)
+
+        // Exact aspect match (1920x1200 -> 1.6) fills full [0..1]
+        val matched = com.example.host.MirrorGeometry.computeCenteredFitBounds(
+            hostWidthPx = 1920,
+            hostHeightPx = 1200,
+            encoderWidthPx = 1280,
+            encoderHeightPx = 800
+        )
+        assertEquals(0f, matched.normLeft, 0.0001f)
+        assertEquals(0f, matched.normTop, 0.0001f)
+        assertEquals(1f, matched.normRight, 0.0001f)
+        assertEquals(1f, matched.normBottom, 0.0001f)
+    }
+
+    @Test
+    fun mirrorGeometryMapsActiveRegionTouchesToDisplay0AndIgnoresMargins() {
+        val bounds = com.example.host.MirrorGeometry.computeCenteredFitBounds(
+            hostWidthPx = 1080,
+            hostHeightPx = 2400,
+            encoderWidthPx = 1280,
+            encoderHeightPx = 800
+        )
+
+        // Left & right pillarbox margin taps must be ignored (return null)
+        assertNull(com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(0.05f, 0.5f, bounds))
+        assertNull(com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(0.95f, 0.5f, bounds))
+        assertNull(com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(0.5f, 0.5f, null))
+
+        // Center of encoder surface maps to exact center of Display 0 (1079/2, 2399/2)
+        val center = com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(0.5f, 0.5f, bounds)
+        assertNotNull(center)
+        assertEquals(1079f * 0.5f, center!!.first, 0.5f)
+        assertEquals(2399f * 0.5f, center.second, 0.5f)
+
+        // Content rect boundaries map to Display 0 (0,0) and (width-1, height-1)
+        val topLeft = com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(
+            bounds.normLeft,
+            bounds.normTop,
+            bounds
+        )
+        assertNotNull(topLeft)
+        assertEquals(0f, topLeft!!.first, 0.01f)
+        assertEquals(0f, topLeft.second, 0.01f)
+
+        val bottomRight = com.example.host.MirrorGeometry.mapDisplayTouchToHostDisplay0(
+            bounds.normRight,
+            bounds.normBottom,
+            bounds
+        )
+        assertNotNull(bottomRight)
+        assertEquals(1079f, bottomRight!!.first, 0.5f)
+        assertEquals(2399f, bottomRight.second, 0.5f)
+
+        // Aspect-fit surface size returns even dimensions for H.264 encoder compatibility
+        val (fitW, fitH) = com.example.host.MirrorGeometry.computeAspectFitSurfaceSize(
+            hostWidthPx = 1080,
+            hostHeightPx = 2400,
+            maxWidthPx = 1280,
+            maxHeightPx = 800
+        )
+        assertEquals(0, fitW % 2)
+        assertEquals(0, fitH % 2)
+        assertEquals(800, fitH)
+        assertEquals(360, fitW)
+    }
 }
+
 

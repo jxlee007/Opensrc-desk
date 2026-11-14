@@ -48,25 +48,12 @@ class ShizukuDesktopUserService : IShizukuDesktopService.Stub() {
 
     override fun queryHostForegroundPackages(displayId: Int): String {
         val stackOut = execCommand(arrayOf("am", "stack", "list")).stdout
-        val pkgs = linkedSetOf<String>()
-        val targetDisplayToken = "displayId=$displayId"
-        var inTargetDisplay = true
+        return parsePackagesFromStackList(stackOut) { it == displayId }.joinToString(",")
+    }
 
-        stackOut.lineSequence().forEach { line ->
-            val trimmed = line.trim()
-            if (trimmed.startsWith("Stack") || trimmed.startsWith("RootTask") || trimmed.contains("displayId=")) {
-                inTargetDisplay = trimmed.contains(targetDisplayToken) || !trimmed.contains("displayId=")
-            }
-            if (inTargetDisplay && (trimmed.contains("realActivity=") || trimmed.contains("topActivity="))) {
-                val match = PACKAGE_REGEX.find(trimmed)
-                match?.groupValues?.getOrNull(1)?.let { pkg ->
-                    if (!pkg.startsWith("com.android.launcher") && !pkg.startsWith("com.android.systemui")) {
-                        pkgs.add(pkg)
-                    }
-                }
-            }
-        }
-        return pkgs.joinToString(",")
+    override fun queryVirtualDisplayPackages(): String {
+        val stackOut = execCommand(arrayOf("am", "stack", "list")).stdout
+        return parsePackagesFromStackList(stackOut) { it > 0 }.joinToString(",")
     }
 
     override fun probeShellInputDisplayFlag(): Boolean {
@@ -169,7 +156,38 @@ class ShizukuDesktopUserService : IShizukuDesktopService.Stub() {
     companion object {
         private const val ACTION_TAP = 0
         const val WINDOWING_MODE_FREEFORM = 5
-        private val PACKAGE_REGEX = Regex("(?:realActivity|topActivity)=ComponentInfo\\{?([A-Za-z0-9._]+)/")
+        private val PACKAGE_REGEX = Regex("(?:realActivity|topActivity)=(?:ComponentInfo\\{)?([A-Za-z0-9._]+)/")
+        private val DISPLAY_ID_REGEX = Regex("(?:displayId=|Display #)(\\d+)")
+
+        fun parsePackagesFromStackList(
+            stackOut: String,
+            displayFilter: (Int) -> Boolean
+        ): Set<String> {
+            val pkgs = linkedSetOf<String>()
+            var currentDisplayId = 0
+
+            stackOut.lineSequence().forEach { line ->
+                val trimmed = line.trim()
+                val dispMatch = DISPLAY_ID_REGEX.find(trimmed)
+                if (dispMatch != null) {
+                    currentDisplayId = dispMatch.groupValues.getOrNull(1)?.toIntOrNull() ?: currentDisplayId
+                } else if (trimmed.startsWith("Stack") || trimmed.startsWith("RootTask")) {
+                    // Lines starting a new Stack/RootTask without an explicit displayId default to Display 0
+                    currentDisplayId = 0
+                }
+                if (displayFilter(currentDisplayId) &&
+                    (trimmed.contains("realActivity=") || trimmed.contains("topActivity="))
+                ) {
+                    val match = PACKAGE_REGEX.find(trimmed)
+                    match?.groupValues?.getOrNull(1)?.let { pkg ->
+                        if (!pkg.startsWith("com.android.launcher") && !pkg.startsWith("com.android.systemui")) {
+                            pkgs.add(pkg)
+                        }
+                    }
+                }
+            }
+            return pkgs
+        }
 
         fun buildFreeformLaunchCommand(
             safePkg: String,

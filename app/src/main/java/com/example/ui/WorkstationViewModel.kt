@@ -125,6 +125,17 @@ class WorkstationViewModel(application: Application) : AndroidViewModel(applicat
 
     fun focusDesktopShell() = runtime.focusDesktopShell()
 
+    fun startHostMirroring(resultCode: Int, data: android.content.Intent) =
+        runtime.startHostMirroring(resultCode, data)
+
+    fun stopHostMirroring() = runtime.stopHostMirroring()
+
+    fun setMirrorRightClickAsBack(enabled: Boolean) = runtime.setMirrorRightClickAsBack(enabled)
+
+    fun setMirrorAspectFallback(enabled: Boolean) = runtime.setMirrorAspectFallback(enabled)
+
+    fun showBanner(message: String) = runtime.showBanner(message)
+
     fun ensureDisplayStandbyForegroundService(port: Int) =
         runtime.ensureDisplayStandbyForegroundService(port)
 

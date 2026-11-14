@@ -85,9 +85,9 @@ class H264StreamEncoder(
         return surface
     }
 
-    fun requestSyncFrameBurst() {
+    fun requestSyncFrameBurst(forceImmediate: Boolean = false) {
         val now = System.currentTimeMillis()
-        if (now - lastSyncRequestMs.get() < 250L) return
+        if (!forceImmediate && now - lastSyncRequestMs.get() < 250L) return
         lastSyncRequestMs.set(now)
         try {
             val params = Bundle().apply {

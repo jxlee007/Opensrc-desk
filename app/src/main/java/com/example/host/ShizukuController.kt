@@ -223,6 +223,15 @@ class ShizukuController(private val context: Context) {
         return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
     }
 
+    fun queryActiveVirtualDisplayPackages(): Set<String> {
+        val raw = runCatching { desktopUserService?.queryVirtualDisplayPackages() }.getOrNull()
+        if (raw.isNullOrBlank()) return emptySet()
+        return raw.split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != context.packageName }
+            .toSet()
+    }
+
     fun enableFreeformDesktopSupport(): Boolean {
         if (!isAuthorized()) return false
         return runCatching { desktopUserService?.enableFreeformDesktopSupport() == true }

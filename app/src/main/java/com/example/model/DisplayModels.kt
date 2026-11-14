@@ -7,6 +7,21 @@ enum class DeviceRole {
     DISPLAY
 }
 
+enum class ProjectionMode {
+    EXTENDED_DESKTOP,
+    MIRROR_HOST_SCREEN
+}
+
+@Serializable
+data class MirrorContentBounds(
+    val normLeft: Float,
+    val normTop: Float,
+    val normRight: Float,
+    val normBottom: Float,
+    val hostWidthPx: Int,
+    val hostHeightPx: Int
+)
+
 @Serializable
 enum class TrustedPeerRole {
     HOST_SAVED_DISPLAY,

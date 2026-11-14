@@ -1341,4 +1341,93 @@ class ExtendedDesktopRobolectricTest {
             com.example.host.DesktopShellBridge.releaseAndCloseShell()
         }
     }
+
+    @Test
+    fun extendedDesktopServiceEscalatesAndDowngradesMediaProjectionFgsBarrier() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val controller = org.robolectric.Robolectric.buildService(com.example.service.ExtendedDesktopService::class.java)
+            .create()
+        val service = controller.get()
+        try {
+            val advisory = com.example.model.PerformanceAdvisory()
+
+            // Normal Host start keeps activeMediaProjectionFgs = false
+            val startIntent = android.content.Intent(app, com.example.service.ExtendedDesktopService::class.java).apply {
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_TITLE, com.example.service.ExtendedDesktopService.TITLE_LIVE)
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_LINE_1, advisory.notificationLine1())
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_LINE_2, advisory.notificationLine2())
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_INCLUDE_MEDIA_PROJECTION, false)
+            }
+            service.onStartCommand(startIntent, 0, 1)
+            assertFalse(com.example.service.ExtendedDesktopService.activeMediaProjectionFgs)
+
+            // Synchronous barrier escalation activates FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION before returning
+            val escalateIntent = android.content.Intent(app, com.example.service.ExtendedDesktopService::class.java).apply {
+                action = com.example.service.ExtendedDesktopService.ACTION_ESCALATE_MEDIA_PROJECTION
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_TITLE, com.example.service.ExtendedDesktopService.TITLE_MIRROR)
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_LINE_1, "Mirroring Host Screen")
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_INCLUDE_MEDIA_PROJECTION, true)
+            }
+            service.onStartCommand(escalateIntent, 0, 2)
+            assertTrue(com.example.service.ExtendedDesktopService.activeMediaProjectionFgs)
+            assertEquals(
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+                service.foregroundServiceType
+            )
+
+            // Downgrade resets activeMediaProjectionFgs cleanly
+            val downgradeIntent = android.content.Intent(app, com.example.service.ExtendedDesktopService::class.java).apply {
+                action = com.example.service.ExtendedDesktopService.ACTION_DOWNGRADE_MEDIA_PROJECTION
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_TITLE, com.example.service.ExtendedDesktopService.TITLE_LIVE)
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_LINE_1, advisory.notificationLine1())
+                putExtra(com.example.service.ExtendedDesktopService.EXTRA_INCLUDE_MEDIA_PROJECTION, false)
+            }
+            service.onStartCommand(downgradeIntent, 0, 3)
+            assertFalse(com.example.service.ExtendedDesktopService.activeMediaProjectionFgs)
+            assertEquals(
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                service.foregroundServiceType
+            )
+        } finally {
+            controller.destroy()
+        }
+    }
+
+    @Test
+    fun hostSessionEngineMirrorModeGuardrailsAndRightClickSettingWorkWithoutShizuku() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val hostStore = TrustedPeerStore(context, KeystoreCrypto(context, WorkingVault()), isolatedDataStore(context, "mirror_guard_ds"))
+        val hostEngine = com.example.host.HostSessionEngine(
+            context,
+            hostStore,
+            com.example.host.ShizukuController(context),
+            KeystoreCrypto(context, WorkingVault())
+        )
+        try {
+            val bounds = com.example.host.MirrorGeometry.computeCenteredFitBounds(1080, 2400, 1280, 800)
+            hostEngine.seedMirrorModeForTest(bounds = bounds, connected = true, rightClickAsBack = false)
+
+            assertEquals(com.example.model.ProjectionMode.MIRROR_HOST_SCREEN, hostEngine.telemetry.value.projectionMode)
+            assertFalse(hostEngine.telemetry.value.mirrorRightClickAsBack)
+            assertFalse(hostEngine.telemetry.value.mirrorAspectFallbackEnabled)
+
+            // Launching Display 1 apps is blocked cleanly during Mirror mode
+            val launchNote = hostEngine.launchAppExclusive("com.example.app")
+            assertTrue(launchNote.contains("Switch to Extended Desktop"))
+
+            // View-only Mirror safely ignores touch/IME without throwing or injecting when Shizuku is inactive
+            hostEngine.sendTrackpadDelta(0.1f, 0.1f, com.example.protocol.TouchSample.ACTION_DOWN)
+            hostEngine.sendImeInput("hello", 0)
+
+            // Toggles update telemetry cleanly
+            hostEngine.setMirrorRightClickAsBack(true)
+            hostEngine.setMirrorAspectFallback(true)
+            assertTrue(hostEngine.telemetry.value.mirrorRightClickAsBack)
+            assertTrue(hostEngine.telemetry.value.mirrorAspectFallbackEnabled)
+        } finally {
+            hostEngine.disconnect("Cleanup")
+        }
+    }
 }
+

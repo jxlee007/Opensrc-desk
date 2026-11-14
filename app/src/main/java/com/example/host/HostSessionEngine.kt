@@ -1,12 +1,20 @@
 package com.example.host
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
+import android.view.KeyEvent
+import android.view.Surface
+import android.view.WindowManager
 import com.example.core.DisplaySynthesizer
 import com.example.core.KeystoreCrypto
 import com.example.core.TrustedPeerStore
@@ -14,8 +22,10 @@ import com.example.display.DisplaySessionEngine
 import com.example.model.DiscoveredPeer
 import com.example.model.DisplayProfile
 import com.example.model.InputBackendStatus
+import com.example.model.MirrorContentBounds
 import com.example.model.PendingSasConfirmation
 import com.example.model.PerformanceAdvisory
+import com.example.model.ProjectionMode
 import com.example.model.ResolutionCeiling
 import com.example.model.TrustedPeerRole
 import com.example.model.VirtualDisplayConfig
@@ -35,6 +45,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -57,7 +68,11 @@ data class HostTelemetry(
     val advisory: PerformanceAdvisory = PerformanceAdvisory(),
     val inputBackendStatus: InputBackendStatus = InputBackendStatus.PREVIEW_CURSOR_ONLY,
     val sessionOnlyTrustMode: Boolean = false,
-    val securityNotice: String? = null
+    val securityNotice: String? = null,
+    val projectionMode: ProjectionMode = ProjectionMode.EXTENDED_DESKTOP,
+    val mirrorRightClickAsBack: Boolean = false,
+    val mirrorAspectFallbackEnabled: Boolean = false,
+    val mirrorBounds: MirrorContentBounds? = null
 )
 
 class HostSessionEngine(
@@ -80,6 +95,7 @@ class HostSessionEngine(
     val pendingSasConfirmation: StateFlow<PendingSasConfirmation?> = _pendingSasConfirmation.asStateFlow()
 
     var onHostForegroundPackagesUpdated: ((Set<String>) -> Unit)? = null
+    var onModeBannerMessage: ((String) -> Unit)? = null
 
     private val socketLock = Any()
     private var teardownJob: Job? = null
@@ -94,6 +110,12 @@ class HostSessionEngine(
 
     private var encoder: H264StreamEncoder? = null
     private var virtualDisplay: VirtualDisplay? = null
+    private var mediaProjection: MediaProjection? = null
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
+
+    private val sessionLaunchedApps: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    @Volatile
+    private var savedExtendedApps: Set<String> = emptySet()
 
     @Volatile
     private var launchableAppsCache: List<com.example.model.InstalledAppInfo> = emptyList()
@@ -667,10 +689,35 @@ class HostSessionEngine(
     }
 
     private fun handlePointerInput(action: Byte, normX: Float, normY: Float, label: String) {
+        val currentTel = _telemetry.value
+        val shizukuAuth = shizukuController.isAuthorized()
+        if (currentTel.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN) {
+            if (!shizukuAuth) return
+            if (action == TouchSample.ACTION_RIGHT_CLICK) {
+                if (currentTel.mirrorRightClickAsBack) {
+                    shizukuController.injectKeyOrTextOnDisplay(0, null, KeyEvent.KEYCODE_BACK)
+                    encoder?.requestSyncFrameBurst()
+                }
+                return
+            }
+            val mapped = MirrorGeometry.mapDisplayTouchToHostDisplay0(normX, normY, currentTel.mirrorBounds)
+                ?: return
+            shizukuController.injectTouchOnDisplay(
+                displayId = 0,
+                action = action,
+                xPx = mapped.first,
+                yPx = mapped.second
+            )
+            _telemetry.value = _telemetry.value.copy(
+                inputBackendStatus = shizukuController.inputBackendStatus.value
+            )
+            encoder?.requestSyncFrameBurst()
+            return
+        }
+
         DesktopShellBridge.updateCursor(normX, normY, label)
         val displayId = virtualDisplay?.display?.displayId
         val cfg = currentConfig
-        val shizukuAuth = shizukuController.isAuthorized()
         val routeInProcess = DesktopShellBridge.shouldRouteTouchInProcess(
             webLayerActive = DesktopShellBridge.webLayerActive,
             appDrawerVisible = DesktopShellBridge.appDrawerVisible,
@@ -694,6 +741,14 @@ class HostSessionEngine(
     }
 
     fun sendImeInput(textInput: String?, keyCode: Int) {
+        val currentTel = _telemetry.value
+        if (currentTel.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN) {
+            if (shizukuController.isAuthorized()) {
+                shizukuController.injectKeyOrTextOnDisplay(0, textInput, keyCode)
+                encoder?.requestSyncFrameBurst()
+            }
+            return
+        }
         DesktopShellBridge.appendImeText(textInput, keyCode)
         val displayId = virtualDisplay?.display?.displayId
         if (displayId != null &&
@@ -706,14 +761,241 @@ class HostSessionEngine(
         encoder?.requestSyncFrameBurst()
     }
 
+    fun setMirrorRightClickAsBack(enabled: Boolean) {
+        _telemetry.value = _telemetry.value.copy(mirrorRightClickAsBack = enabled)
+    }
+
+    fun setMirrorAspectFallback(enabled: Boolean) {
+        val currentTel = _telemetry.value
+        _telemetry.value = currentTel.copy(mirrorAspectFallbackEnabled = enabled)
+        if (currentTel.projectionMode != ProjectionMode.MIRROR_HOST_SCREEN) return
+        val cfg = currentConfig ?: return
+        val vd = virtualDisplay ?: return
+        mainHandler.post {
+            val (hostW, hostH, hostDpi) = captureHostDisplay0Metrics()
+            val (vdW, vdH) = if (enabled) {
+                MirrorGeometry.computeAspectFitSurfaceSize(hostW, hostH, cfg.targetWidth, cfg.targetHeight)
+            } else {
+                cfg.targetWidth to cfg.targetHeight
+            }
+            val bounds = MirrorGeometry.computeCenteredFitBounds(hostW, hostH, cfg.targetWidth, cfg.targetHeight)
+            runCatching { vd.resize(vdW, vdH, hostDpi) }
+            _telemetry.value = _telemetry.value.copy(mirrorBounds = bounds)
+            encoder?.requestSyncFrameBurst(forceImmediate = true)
+        }
+    }
+
+    suspend fun switchToMirrorMode(resultCode: Int, data: Intent): Boolean {
+        if (!_telemetry.value.connected || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return false
+        }
+        val surface = encoder?.inputSurface ?: return false
+        val cfg = currentConfig ?: return false
+
+        val fgsReady = ExtendedDesktopService.escalateForMediaProjectionAndAwait(
+            context = context,
+            advisory = _telemetry.value.advisory
+        )
+        if (!fgsReady) {
+            onModeBannerMessage?.invoke("Unable to elevate foreground service for screen capture")
+            return false
+        }
+
+        val switched = withContext(Dispatchers.Main.immediate) {
+            val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+            val projection = runCatching { mpm?.getMediaProjection(resultCode, data) }.getOrNull()
+            if (projection == null) {
+                ExtendedDesktopService.downgradeFromMediaProjection(context, _telemetry.value.advisory)
+                return@withContext false
+            }
+
+            releaseActiveMediaProjectionLocked()
+            savedExtendedApps = _telemetry.value.activeDesktopApps
+
+            runCatching { DesktopShellBridge.releaseAndCloseShell() }
+            runCatching { virtualDisplay?.setSurface(null) }
+            runCatching { virtualDisplay?.release() }
+            virtualDisplay = null
+
+            val cb = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    scope.launch {
+                        switchToExtendedDesktopMode(fromSystemStop = true)
+                    }
+                }
+            }
+            mediaProjection = projection
+            mediaProjectionCallback = cb
+            projection.registerCallback(cb, mainHandler)
+
+            val (hostW, hostH, hostDpi) = captureHostDisplay0Metrics()
+            val useAspectFallback = _telemetry.value.mirrorAspectFallbackEnabled
+            val (vdW, vdH) = if (useAspectFallback) {
+                MirrorGeometry.computeAspectFitSurfaceSize(hostW, hostH, cfg.targetWidth, cfg.targetHeight)
+            } else {
+                cfg.targetWidth to cfg.targetHeight
+            }
+            val bounds = MirrorGeometry.computeCenteredFitBounds(hostW, hostH, cfg.targetWidth, cfg.targetHeight)
+
+            val mirrorVd = runCatching {
+                projection.createVirtualDisplay(
+                    "ExtendedDesktopMirror",
+                    vdW,
+                    vdH,
+                    hostDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    surface,
+                    null,
+                    mainHandler
+                )
+            }.getOrNull()
+
+            if (mirrorVd == null) {
+                releaseActiveMediaProjectionLocked()
+                ExtendedDesktopService.downgradeFromMediaProjection(context, _telemetry.value.advisory)
+                attachExtendedVirtualDisplayOnMain(
+                    config = cfg,
+                    surface = surface,
+                    modeLabel = if (shizukuController.isAuthorized()) "SHIZUKU FULL" else "LAYOUT PREVIEW"
+                )
+                return@withContext false
+            }
+
+            virtualDisplay = mirrorVd
+            val shizukuAuth = shizukuController.isAuthorized()
+            _telemetry.value = _telemetry.value.copy(
+                projectionMode = ProjectionMode.MIRROR_HOST_SCREEN,
+                virtualDisplayId = mirrorVd.display.displayId,
+                mirrorBounds = bounds,
+                statusNote = if (shizukuAuth) "Active • Mirror Host Screen" else "Active • View-only Mirror"
+            )
+            ExtendedDesktopService.updateHostNotification(
+                context = context,
+                advisory = _telemetry.value.advisory,
+                isMirrorMode = true
+            )
+            encoder?.requestSyncFrameBurst(forceImmediate = true)
+            mainHandler.postDelayed({ encoder?.requestSyncFrameBurst(forceImmediate = true) }, 120L)
+            true
+        }
+
+        if (switched) {
+            sendModeChangeMessage(reason = "PROJECTION_MODE_SWITCH", newMode = "MIRROR_HOST_SCREEN")
+        }
+        return switched
+    }
+
+    fun switchToExtendedDesktopMode(fromSystemStop: Boolean = false) {
+        scope.launch {
+            val wasMirror = _telemetry.value.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN ||
+                mediaProjection != null
+            if (!wasMirror) return@launch
+
+            withContext(Dispatchers.Main.immediate) {
+                releaseActiveMediaProjectionLocked()
+                runCatching { virtualDisplay?.setSurface(null) }
+                runCatching { virtualDisplay?.release() }
+                virtualDisplay = null
+
+                val restoredApps = savedExtendedApps.ifEmpty { sessionLaunchedApps.toSet() }
+                val nextAdvisory = advisor.sample(
+                    displayAppsCount = restoredApps.size,
+                    shizukuAuthorized = shizukuController.isAuthorized()
+                )
+                ExtendedDesktopService.downgradeFromMediaProjection(context, nextAdvisory)
+
+                val cfg = currentConfig
+                val surface = encoder?.inputSurface
+                if (_telemetry.value.connected && cfg != null && surface != null) {
+                    val modeLabel = if (shizukuController.isAuthorized()) "SHIZUKU FULL" else "LAYOUT PREVIEW"
+                    attachExtendedVirtualDisplayOnMain(cfg, surface, modeLabel)
+                    _telemetry.value = _telemetry.value.copy(
+                        projectionMode = ProjectionMode.EXTENDED_DESKTOP,
+                        mirrorBounds = null,
+                        activeDesktopApps = restoredApps,
+                        advisory = nextAdvisory,
+                        statusNote = if (shizukuController.isAuthorized()) {
+                            "Active • Shizuku Multi-Display"
+                        } else {
+                            "Active • Layout Preview"
+                        }
+                    )
+                    encoder?.requestSyncFrameBurst(forceImmediate = true)
+                    mainHandler.postDelayed({ encoder?.requestSyncFrameBurst(forceImmediate = true) }, 120L)
+                } else {
+                    _telemetry.value = _telemetry.value.copy(
+                        projectionMode = ProjectionMode.EXTENDED_DESKTOP,
+                        mirrorBounds = null
+                    )
+                }
+            }
+
+            if (_telemetry.value.connected) {
+                sendModeChangeMessage(reason = "PROJECTION_MODE_SWITCH", newMode = "EXTENDED_DESKTOP")
+            }
+            if (fromSystemStop) {
+                onModeBannerMessage?.invoke("Host screen capture stopped — returned to Extended Desktop")
+            }
+        }
+    }
+
+    private fun sendModeChangeMessage(reason: String, newMode: String) {
+        val out = synchronized(socketLock) { controlOut } ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                ControlCodec.writeJsonFrame(
+                    out,
+                    ControlMessage.ModeChange(reason = reason, newMode = newMode)
+                )
+            }
+        }
+    }
+
+    private fun releaseActiveMediaProjectionLocked() {
+        val proj = mediaProjection
+        val cb = mediaProjectionCallback
+        mediaProjection = null
+        mediaProjectionCallback = null
+        if (proj != null) {
+            if (cb != null) {
+                runCatching { proj.unregisterCallback(cb) }
+            }
+            runCatching { proj.stop() }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun captureHostDisplay0Metrics(): Triple<Int, Int, Int> {
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            val dpi = context.resources.displayMetrics.densityDpi.coerceAtLeast(120)
+            if (bounds.width() > 0 && bounds.height() > 0) {
+                return Triple(bounds.width(), bounds.height(), dpi)
+            }
+        }
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm?.defaultDisplay?.getRealMetrics(dm)
+        val w = dm.widthPixels.takeIf { it > 0 } ?: context.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.takeIf { it > 0 } ?: context.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        val dpi = dm.densityDpi.takeIf { it > 0 } ?: context.resources.displayMetrics.densityDpi.coerceAtLeast(120)
+        return Triple(w, h, dpi)
+    }
+
     fun launchAppExclusive(packageName: String): String {
+        if (_telemetry.value.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN) {
+            return "Switch to Extended Desktop to launch apps on Display 1"
+        }
         val displayId = virtualDisplay?.display?.displayId ?: return "No virtual display active"
         if (!shizukuController.isAuthorized()) {
             return "Third-party app launch requires Shizuku. Use Layout Preview panels or activate Shizuku."
         }
         val launched = shizukuController.launchAppOnDisplay(packageName, displayId)
         return if (launched) {
+            sessionLaunchedApps.add(packageName)
             val updated = _telemetry.value.activeDesktopApps + packageName
+            savedExtendedApps = updated
             val nextAdvisory = advisor.sample(
                 displayAppsCount = updated.size,
                 shizukuAuthorized = shizukuController.isAuthorized()
@@ -734,6 +1016,9 @@ class HostSessionEngine(
 
     @androidx.annotation.VisibleForTesting
     internal fun seedActiveDesktopAppsForTest(pkgs: Set<String>, connected: Boolean) {
+        sessionLaunchedApps.clear()
+        sessionLaunchedApps.addAll(pkgs)
+        savedExtendedApps = pkgs
         _telemetry.value = _telemetry.value.copy(
             connected = connected,
             activeDesktopApps = pkgs,
@@ -741,7 +1026,23 @@ class HostSessionEngine(
         )
     }
 
+    @androidx.annotation.VisibleForTesting
+    internal fun seedMirrorModeForTest(
+        bounds: MirrorContentBounds,
+        connected: Boolean = true,
+        rightClickAsBack: Boolean = false
+    ) {
+        _telemetry.value = _telemetry.value.copy(
+            connected = connected,
+            projectionMode = ProjectionMode.MIRROR_HOST_SCREEN,
+            mirrorBounds = bounds,
+            mirrorRightClickAsBack = rightClickAsBack
+        )
+    }
+
     fun markAppMovedBackToHost(packageName: String) {
+        sessionLaunchedApps.remove(packageName)
+        savedExtendedApps = savedExtendedApps - packageName
         val current = _telemetry.value
         if (!current.activeDesktopApps.contains(packageName)) return
         val updated = current.activeDesktopApps - packageName
@@ -756,7 +1057,11 @@ class HostSessionEngine(
             inputBackendStatus = shizukuController.inputBackendStatus.value
         )
         if (current.connected) {
-            ExtendedDesktopService.updateHostNotification(context, nextAdvisory)
+            ExtendedDesktopService.updateHostNotification(
+                context = context,
+                advisory = nextAdvisory,
+                isMirrorMode = current.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN
+            )
         }
     }
 
@@ -942,25 +1247,41 @@ class HostSessionEngine(
         advisorJob?.cancel()
         advisorJob = scope.launch {
             while (isActive && _telemetry.value.connected) {
-                val appCount = _telemetry.value.activeDesktopApps.size
-                val sample = advisor.sample(
-                    displayAppsCount = appCount,
-                    shizukuAuthorized = shizukuController.isAuthorized()
-                )
-                if (sample.freeRamPercent < 25 && !DesktopShellBridge.webLayerActive) {
-                    DesktopShellBridge.trimWebMemoryToColdBundle()
-                }
-                val hostForeground = if (shizukuController.isAuthorized()) {
+                val shizukuAuth = shizukuController.isAuthorized()
+                val isMirror = _telemetry.value.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN
+                val hostForeground = if (shizukuAuth) {
                     shizukuController.queryActiveHostPackages()
                 } else {
                     emptySet()
                 }
                 onHostForegroundPackagesUpdated?.invoke(hostForeground)
+
+                val mergedVirtualApps = if (shizukuAuth && !isMirror) {
+                    val stackVirtual = shizukuController.queryActiveVirtualDisplayPackages()
+                    val merged = sessionLaunchedApps + stackVirtual
+                    savedExtendedApps = merged
+                    merged
+                } else {
+                    _telemetry.value.activeDesktopApps
+                }
+
+                val sample = advisor.sample(
+                    displayAppsCount = mergedVirtualApps.size,
+                    shizukuAuthorized = shizukuAuth
+                )
+                if (sample.freeRamPercent < 25 && !DesktopShellBridge.webLayerActive && !isMirror) {
+                    DesktopShellBridge.trimWebMemoryToColdBundle()
+                }
                 _telemetry.value = _telemetry.value.copy(
+                    activeDesktopApps = mergedVirtualApps,
                     advisory = sample,
                     inputBackendStatus = shizukuController.inputBackendStatus.value
                 )
-                ExtendedDesktopService.updateHostNotification(context, sample)
+                ExtendedDesktopService.updateHostNotification(
+                    context = context,
+                    advisory = sample,
+                    isMirrorMode = isMirror
+                )
                 delay(3000L)
             }
         }
@@ -969,22 +1290,31 @@ class HostSessionEngine(
     fun handleShizukuLostMidStream() {
         if (!_telemetry.value.connected) return
         val cfg = currentConfig ?: return
-        DesktopShellBridge.updateConfig(cfg, "LAYOUT PREVIEW (RECOVERED)")
+        val isMirror = _telemetry.value.projectionMode == ProjectionMode.MIRROR_HOST_SCREEN
+        if (!isMirror) {
+            DesktopShellBridge.updateConfig(cfg, "LAYOUT PREVIEW (RECOVERED)")
+        }
         _telemetry.value = _telemetry.value.copy(
-            statusNote = "Shizuku stopped — seamlessly switched to Layout Preview",
+            statusNote = if (isMirror) {
+                "Shizuku stopped — Mirror switched to view-only"
+            } else {
+                "Shizuku stopped — seamlessly switched to Layout Preview"
+            },
             inputBackendStatus = InputBackendStatus.PREVIEW_CURSOR_ONLY
         )
-        val out = synchronized(socketLock) { controlOut } ?: return
-        scope.launch {
-            try {
-                ControlCodec.writeJsonFrame(
-                    out,
-                    ControlMessage.ModeChange(
-                        reason = "SHIZUKU_LOST",
-                        newMode = "LAYOUT_PREVIEW"
+        if (!isMirror) {
+            val out = synchronized(socketLock) { controlOut } ?: return
+            scope.launch {
+                try {
+                    ControlCodec.writeJsonFrame(
+                        out,
+                        ControlMessage.ModeChange(
+                            reason = "SHIZUKU_LOST",
+                            newMode = "LAYOUT_PREVIEW"
+                        )
                     )
-                )
-            } catch (_: Throwable) {
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -997,6 +1327,8 @@ class HostSessionEngine(
         advisorJob?.cancel()
         advisorJob = null
         _pendingSasConfirmation.value = null
+        sessionLaunchedApps.clear()
+        savedExtendedApps = emptySet()
 
         val oldCtrlOut: DataOutputStream?
         val oldCtrlSock: Socket?
@@ -1025,6 +1357,7 @@ class HostSessionEngine(
         }
 
         mainHandler.post {
+            releaseActiveMediaProjectionLocked()
             runCatching { DesktopShellBridge.releaseAndCloseShell() }
             runCatching { oldVd?.release() }
         }
@@ -1090,71 +1423,78 @@ class HostSessionEngine(
         )
         encoder = enc
         val surface = enc.start()
+        mainHandler.post {
+            attachExtendedVirtualDisplayOnMain(config, surface, modeLabel)
+        }
+    }
+
+    private fun attachExtendedVirtualDisplayOnMain(
+        config: VirtualDisplayConfig,
+        surface: Surface,
+        modeLabel: String
+    ) {
         val apps = launchableAppsCache.ifEmpty {
             shizukuController.listLaunchableApps(emptySet(), emptySet()).also {
                 launchableAppsCache = it
             }
         }
-
-        mainHandler.post {
-            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-            val vd = dm.createVirtualDisplay(
-                "ExtendedDesktopDisplay",
-                config.targetWidth,
-                config.targetHeight,
-                config.targetDpi,
-                surface,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-            )
-            virtualDisplay = vd
-            val displayId = vd.display.displayId
-            val shizukuAuth = shizukuController.isAuthorized()
-            DesktopShellBridge.prepareSession(
-                expectedDisplayId = displayId,
-                config = config,
-                modeLabel = modeLabel,
-                shizukuAuthorized = shizukuAuth,
-                apps = apps,
-                diagnosticOnly = false,
-                shellCallbacks = object : DesktopShellBridge.ShellCallbacks {
-                    override fun onLaunchAppFromTaskbar(packageName: String) {
-                        scope.launch(Dispatchers.IO) {
-                            launchAppExclusive(packageName)
-                        }
-                    }
-
-                    override fun onWorkspaceLayerChanged(webLayerActive: Boolean) {
-                        encoder?.requestSyncFrameBurst()
-                    }
-
-                    override fun onDrawerVisibilityChanged(visible: Boolean) {
-                        encoder?.requestSyncFrameBurst()
-                    }
-
-                    override fun onShellDisplayVerified(displayId: Int) {
-                        _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
-                        encoder?.requestSyncFrameBurst()
-                    }
-
-                    override fun onShellDisplayRejected(expectedDisplayId: Int, actualDisplayId: Int?) {
-                        val msg =
-                            "Display $expectedDisplayId launch blocked on this ROM (landed on Display ${actualDisplayId ?: -1})"
-                        _telemetry.value = _telemetry.value.copy(
-                            statusNote = msg,
-                            securityNotice = _telemetry.value.securityNotice ?: msg
-                        )
-                    }
-
-                    override fun onVerificationTouchObserved(event: ObservedTouchEvent) {
-                        observedVirtualDisplayTouches.add(event)
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        val vd = dm.createVirtualDisplay(
+            "ExtendedDesktopDisplay",
+            config.targetWidth,
+            config.targetHeight,
+            config.targetDpi,
+            surface,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+        )
+        virtualDisplay = vd
+        val displayId = vd.display.displayId
+        val shizukuAuth = shizukuController.isAuthorized()
+        DesktopShellBridge.prepareSession(
+            expectedDisplayId = displayId,
+            config = config,
+            modeLabel = modeLabel,
+            shizukuAuthorized = shizukuAuth,
+            apps = apps,
+            diagnosticOnly = false,
+            shellCallbacks = object : DesktopShellBridge.ShellCallbacks {
+                override fun onLaunchAppFromTaskbar(packageName: String) {
+                    scope.launch(Dispatchers.IO) {
+                        launchAppExclusive(packageName)
                     }
                 }
-            )
-            DesktopShellActivity.launchOnDisplay(context, displayId, diagnosticOnly = false)
-                .onFailure { err -> DesktopShellBridge.reportLaunchException(displayId, err) }
-            _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
-        }
+
+                override fun onWorkspaceLayerChanged(webLayerActive: Boolean) {
+                    encoder?.requestSyncFrameBurst()
+                }
+
+                override fun onDrawerVisibilityChanged(visible: Boolean) {
+                    encoder?.requestSyncFrameBurst()
+                }
+
+                override fun onShellDisplayVerified(displayId: Int) {
+                    _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
+                    encoder?.requestSyncFrameBurst(forceImmediate = true)
+                }
+
+                override fun onShellDisplayRejected(expectedDisplayId: Int, actualDisplayId: Int?) {
+                    val msg =
+                        "Display $expectedDisplayId launch blocked on this ROM (landed on Display ${actualDisplayId ?: -1})"
+                    _telemetry.value = _telemetry.value.copy(
+                        statusNote = msg,
+                        securityNotice = _telemetry.value.securityNotice ?: msg
+                    )
+                }
+
+                override fun onVerificationTouchObserved(event: ObservedTouchEvent) {
+                    observedVirtualDisplayTouches.add(event)
+                }
+            }
+        )
+        DesktopShellActivity.launchOnDisplay(context, displayId, diagnosticOnly = false)
+            .onFailure { err -> DesktopShellBridge.reportLaunchException(displayId, err) }
+        _telemetry.value = _telemetry.value.copy(virtualDisplayId = displayId)
     }
 
     private fun readControlLoop(

@@ -900,9 +900,14 @@ class DisplaySessionEngine(
                 when (msg) {
                     is ControlMessage.ModeChange -> {
                         touchDispatcher.setTransitionPaused(true)
+                        val transitionMsg = when (msg.newMode) {
+                            "MIRROR_HOST_SCREEN" -> "Host switching to Mirror Host Screen"
+                            "EXTENDED_DESKTOP" -> "Host switching to Extended Desktop"
+                            else -> "Host switching to Layout Preview"
+                        }
                         _sessionState.value = _sessionState.value.copy(
                             overlayState = DisplayStreamOverlayState.SwitchingMode(
-                                message = "Host switching to Layout Preview"
+                                message = transitionMsg
                             )
                         )
                     }

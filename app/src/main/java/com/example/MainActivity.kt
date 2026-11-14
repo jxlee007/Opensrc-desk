@@ -1,9 +1,15 @@
 package com.example
 
+import android.app.Activity
+import android.content.Context
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -16,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -23,6 +30,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.example.model.DeviceRole
+import com.example.model.ProjectionMode
 import com.example.ui.WorkstationViewModel
 import com.example.ui.screens.DisplayTerminalScreen
 import com.example.ui.screens.HostControllerScreen
@@ -124,6 +132,18 @@ class MainActivity : ComponentActivity() {
                         }
 
                         composable<HostControllerRoute> {
+                            val context = LocalContext.current
+                            val mediaProjectionLauncher = rememberLauncherForActivityResult(
+                                contract = ActivityResultContracts.StartActivityForResult()
+                            ) { result ->
+                                val data = result.data
+                                if (result.resultCode == Activity.RESULT_OK && data != null) {
+                                    viewModel.startHostMirroring(result.resultCode, data)
+                                } else {
+                                    viewModel.showBanner("Screen capture permission canceled — staying in Extended Desktop")
+                                }
+                            }
+
                             HostControllerScreen(
                                 state = state,
                                 onTrackpadDelta = { dx, dy, action ->
@@ -138,6 +158,33 @@ class MainActivity : ComponentActivity() {
                                 onLaunchApp = { pkg -> viewModel.launchAppOnExtendedDisplay(pkg) },
                                 onMoveAppBackToHost = { pkg -> viewModel.moveAppBackToHost(pkg) },
                                 onFocusDesktopShell = { viewModel.focusDesktopShell() },
+                                onSelectProjectionMode = { targetMode ->
+                                    val currentMode = state.hostTelemetry.projectionMode
+                                    if (targetMode == ProjectionMode.MIRROR_HOST_SCREEN &&
+                                        currentMode != ProjectionMode.MIRROR_HOST_SCREEN
+                                    ) {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                            val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+                                            if (mpm != null) {
+                                                mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
+                                            } else {
+                                                viewModel.showBanner("MediaProjection service unavailable on this device")
+                                            }
+                                        } else {
+                                            viewModel.showBanner("Host Screen Mirroring requires Android 10+")
+                                        }
+                                    } else if (targetMode == ProjectionMode.EXTENDED_DESKTOP &&
+                                        currentMode != ProjectionMode.EXTENDED_DESKTOP
+                                    ) {
+                                        viewModel.stopHostMirroring()
+                                    }
+                                },
+                                onToggleMirrorRightClickAsBack = { enabled ->
+                                    viewModel.setMirrorRightClickAsBack(enabled)
+                                },
+                                onToggleMirrorAspectFallback = { enabled ->
+                                    viewModel.setMirrorAspectFallback(enabled)
+                                },
                                 onRequestShizukuPermission = { viewModel.requestShizukuPermission() },
                                 onRefreshShizuku = { viewModel.refreshDiscovery() },
                                 onDisconnect = {

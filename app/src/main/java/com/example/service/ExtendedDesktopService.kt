@@ -14,6 +14,8 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.model.PerformanceAdvisory
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 
 class ExtendedDesktopService : Service() {
 
@@ -21,6 +23,7 @@ class ExtendedDesktopService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            mediaProjectionBarrier?.complete(false)
             WorkstationRuntime.getIfInitialized()?.stopAllFromServiceNotification()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -34,18 +37,38 @@ class ExtendedDesktopService : Service() {
         val title = intent?.getStringExtra(EXTRA_TITLE) ?: TITLE_LIVE
         val line1 = intent?.getStringExtra(EXTRA_LINE_1) ?: "Display apps: 0 running"
         val line2 = intent?.getStringExtra(EXTRA_LINE_2) ?: ""
+        val wantsMediaProjection = intent?.action == ACTION_ESCALATE_MEDIA_PROJECTION ||
+            intent?.getBooleanExtra(EXTRA_INCLUDE_MEDIA_PROJECTION, false) == true
 
         val notification = buildNotification(this, title, line1, line2)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        val startedOk = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val fgsType = if (wantsMediaProjection) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                }
+                startForeground(NOTIFICATION_ID, notification, fgsType)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            activeMediaProjectionFgs = wantsMediaProjection
+            true
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (intent?.action == ACTION_ESCALATE_MEDIA_PROJECTION) {
+            mediaProjectionBarrier?.complete(startedOk)
         }
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        activeMediaProjectionFgs = false
+        mediaProjectionBarrier?.complete(false)
+        super.onDestroy()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -57,17 +80,29 @@ class ExtendedDesktopService : Service() {
         private const val CHANNEL_ID = "extdesk_link_channel"
         private const val NOTIFICATION_ID = 4102
         const val ACTION_STOP = "com.example.action.STOP_EXTDESK"
+        const val ACTION_ESCALATE_MEDIA_PROJECTION = "com.example.action.ESCALATE_MEDIA_PROJECTION"
+        const val ACTION_DOWNGRADE_MEDIA_PROJECTION = "com.example.action.DOWNGRADE_MEDIA_PROJECTION"
         const val EXTRA_TITLE = "title"
         const val EXTRA_LINE_1 = "line_1"
         const val EXTRA_LINE_2 = "line_2"
+        const val EXTRA_INCLUDE_MEDIA_PROJECTION = "include_media_projection"
         const val TITLE_LIVE = "Extended Desktop · Live"
+        const val TITLE_MIRROR = "Mirror Host Screen · Live"
         const val TITLE_STANDBY = "Extended Desktop · Standby"
+
+        @Volatile
+        private var mediaProjectionBarrier: CompletableDeferred<Boolean>? = null
+
+        @Volatile
+        var activeMediaProjectionFgs: Boolean = false
+            private set
 
         fun startHost(context: Context, advisory: PerformanceAdvisory) {
             val intent = Intent(context, ExtendedDesktopService::class.java).apply {
                 putExtra(EXTRA_TITLE, TITLE_LIVE)
                 putExtra(EXTRA_LINE_1, advisory.notificationLine1())
                 putExtra(EXTRA_LINE_2, advisory.notificationLine2())
+                putExtra(EXTRA_INCLUDE_MEDIA_PROJECTION, false)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -76,12 +111,67 @@ class ExtendedDesktopService : Service() {
             }
         }
 
-        fun updateHostNotification(context: Context, advisory: PerformanceAdvisory) {
+        /**
+         * Escalates the foreground service to include FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION and
+         * awaits completion of startForeground(...) BEFORE MediaProjectionManager.getMediaProjection()
+         * is called (mandatory on Android 14+ targetSdk 34+).
+         */
+        suspend fun escalateForMediaProjectionAndAwait(
+            context: Context,
+            advisory: PerformanceAdvisory,
+            timeoutMs: Long = 3_000L
+        ): Boolean {
+            val barrier = CompletableDeferred<Boolean>()
+            mediaProjectionBarrier = barrier
+            val intent = Intent(context, ExtendedDesktopService::class.java).apply {
+                action = ACTION_ESCALATE_MEDIA_PROJECTION
+                putExtra(EXTRA_TITLE, TITLE_MIRROR)
+                putExtra(EXTRA_LINE_1, "Mirroring Host Screen")
+                putExtra(EXTRA_LINE_2, advisory.notificationLine2())
+                putExtra(EXTRA_INCLUDE_MEDIA_PROJECTION, true)
+            }
+            val dispatched = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.isSuccess
+            if (!dispatched) {
+                barrier.complete(false)
+                return false
+            }
+            return withTimeoutOrNull(timeoutMs) { barrier.await() } == true
+        }
+
+        fun downgradeFromMediaProjection(context: Context, advisory: PerformanceAdvisory) {
+            activeMediaProjectionFgs = false
+            val intent = Intent(context, ExtendedDesktopService::class.java).apply {
+                action = ACTION_DOWNGRADE_MEDIA_PROJECTION
+                putExtra(EXTRA_TITLE, TITLE_LIVE)
+                putExtra(EXTRA_LINE_1, advisory.notificationLine1())
+                putExtra(EXTRA_LINE_2, advisory.notificationLine2())
+                putExtra(EXTRA_INCLUDE_MEDIA_PROJECTION, false)
+            }
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }
+        }
+
+        fun updateHostNotification(
+            context: Context,
+            advisory: PerformanceAdvisory,
+            isMirrorMode: Boolean = false
+        ) {
             val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
             val notification = buildNotification(
                 context = context,
-                title = TITLE_LIVE,
-                line1 = advisory.notificationLine1(),
+                title = if (isMirrorMode) TITLE_MIRROR else TITLE_LIVE,
+                line1 = if (isMirrorMode) "Mirroring Host Screen" else advisory.notificationLine1(),
                 line2 = advisory.notificationLine2()
             )
             mgr.notify(NOTIFICATION_ID, notification)
@@ -128,6 +218,8 @@ class ExtendedDesktopService : Service() {
         }
 
         fun stop(context: Context) {
+            activeMediaProjectionFgs = false
+            mediaProjectionBarrier?.complete(false)
             context.stopService(Intent(context, ExtendedDesktopService::class.java))
         }
 
